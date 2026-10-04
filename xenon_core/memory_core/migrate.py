@@ -2,7 +2,7 @@
 migrate.py — P2: 将 Memory/memory_Write 中的记忆迁移到分层因果记忆网络
 
 用法:
-    cd D:\Xenon\agent_Xenon
+    cd <项目根目录>   # 例如: cd Xenon-agent
     python xenon_core/memory_core/migrate.py
 
 策略:

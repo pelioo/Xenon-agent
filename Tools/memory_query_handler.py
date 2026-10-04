@@ -517,7 +517,7 @@ class SmartMemoryHandler(MemoryQueryHandler):
         if mode in ("auto", "semantic"):
             try:
                 from xenon_core.memory_core import MemoryAPI, EmbeddingService
-                model_path = self._model_path or r"D:\Xenon\agent_Xenon\models\bge-small-zh-v1.5"
+                model_path = self._model_path or str(Path(__file__).resolve().parent.parent / "models" / "bge-small-zh-v1.5")
                 embedder = EmbeddingService(model_path)
                 api = MemoryAPI(embedding_service=embedder)
                 result = api.search(keyword, limit=limit, mode="semantic")

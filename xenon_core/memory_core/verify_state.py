@@ -1,9 +1,13 @@
 """验证 .memory/ 最终状态"""
 import json
+import sys
 from pathlib import Path
 
-# .memory 在项目根目录
-memory = Path('D:/Xenon/agent_Xenon/.memory')
+# 动态推导项目根并复用 schema.STORAGE_ROOT（支持 XENON_PROJECT_ROOT 环境变量兜底）
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+from xenon_core.memory_core.schema import STORAGE_ROOT  # noqa: E402
+
+memory = STORAGE_ROOT
 
 # 列出所有 L2 节点
 print('=== L2 星系节点 ===')

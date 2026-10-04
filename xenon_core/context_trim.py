@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any, Callable, Dict, List
 
+from xenon_core import media_payload
 from xenon_core.turn_compactor import compact_history_for_next_context
 
 
@@ -40,7 +41,7 @@ def analyze_context_weight(
                 "tokens": tokens,
                 "tool_call_id": message.get("tool_call_id"),
                 "has_tool_calls": bool(message.get("tool_calls")),
-                "preview": str(message.get("content", ""))[:160],
+                "preview": media_payload.content_to_safe_text(message.get("content", ""))[:160],
             }
         )
 
@@ -263,7 +264,7 @@ def _recent_compact_history(
         message
         for message in sanitized
         if message.get("role") in {"user", "assistant"}
-        and str(message.get("content", "")).strip()
+        and media_payload.content_to_safe_text(message.get("content", "")).strip()
     ]
     return compact[-keep_recent_turns * 2 :]
 
@@ -288,7 +289,7 @@ def _dedupe_messages(messages: Any) -> List[Dict[str, Any]]:
     for message in messages:
         marker = (
             message.get("role"),
-            str(message.get("content", "")),
+            media_payload.content_to_safe_text(message.get("content", "")),
         )
         if marker in seen:
             continue

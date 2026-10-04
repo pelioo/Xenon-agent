@@ -22,16 +22,43 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 os.chdir(PROJECT_ROOT)
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File
+from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from openai import OpenAI
 import uvicorn
 
-from Xenon import AIAgent, AVAILABLE_MODELS, BASE_URL, API_KEY, MODEL, APP_VERSION, MAX_CONTEXT_TOKENS_DEFAULT
+from xenon_core.boot import (
+    AIAgent,
+    AVAILABLE_MODELS,
+    BASE_URL,
+    API_KEY,
+    MODEL,
+    APP_VERSION,
+    MAX_CONTEXT_TOKENS_DEFAULT,
+)
+from xenon_core.config_patch import read_user_config, update_user_config
+from xenon_core.llm_profiles import (
+    activate_profile as llm_activate_profile,
+    delete_profile as llm_delete_profile,
+    get_active_profile_name,
+    get_profile as llm_get_profile,
+    list_profiles as llm_list_profiles,
+    normalize_model_contexts,
+    save_profile as llm_save_profile,
+)
+from xenon_core.providers import list_providers, resolve_client_class
+from xenon_core.settings import load_settings
 from xenon_core.message_flow import ensure_message_integrity
+from xenon_core.media_capability import normalize_input_modalities
+from xenon_core.media_payload import (
+    MAX_ATTACHMENTS_PER_MESSAGE,
+    content_to_safe_text,
+    messages_for_session_store,
+    store_uploaded_media,
+)
 from xenon_core.polling_pool import get_pool
 from webui.database import Database
 from webui.stream_adapter import create_stream_adapter
@@ -132,6 +159,8 @@ WEBUI_CORS_ALLOW_CREDENTIALS = (
 MAX_MESSAGE_LENGTH = 10000  # 最大消息长度
 MAX_SESSIONS = 100  # 最大会话数量，达到上限后自动淘汰最旧的会话（滑动窗口）
 SESSION_THEME_MODEL = MODEL
+# 原生多模态（Phase 2）：WebUI 图片上传缓存目录
+MEDIA_CACHE_DIR = PROJECT_ROOT / "output" / "media_cache"
 SESSION_THEME_MAX_LENGTH = 18
 SESSION_THEME_TIMEOUT = 12
 
@@ -192,17 +221,82 @@ active_streams = ThreadSafeDict()
 running_streams = ThreadSafeDict()
 stream_lifecycle_locks = ThreadSafeDict()
 
+# ── 运行时 LLM 配置 ──
+# 启动时从磁盘读取（与 boot 同源），保存/激活配置后由 _refresh_runtime_llm()
+# 同步最新值并递增代数；get_or_create_agent 发现代数变化时重建 agent，
+# 使供应商/密钥/模型切换无需重启进程即可生效。
+_runtime_llm_lock = threading.RLock()
+# 初始快照用 boot 常量占位；首次 _refresh_runtime_llm() 会用磁盘最新值覆盖
+# （get_or_create_agent 与 /models 每次都会先 refresh，保证读到真实配置）。
+_runtime_llm: Dict[str, Any] = {
+    "provider": "openai_compat",
+    "base_url": BASE_URL,
+    "api_key": API_KEY,
+    "model": MODEL,
+    "available_models": list(AVAILABLE_MODELS),
+    "model_contexts": {},
+    "context_max_tokens": MAX_CONTEXT_TOKENS_DEFAULT,
+    "thinking_enabled": True,
+}
+_runtime_llm_generation = 0
+
+
+def _refresh_runtime_llm() -> Dict[str, Any]:
+    """把磁盘上的最新 LLM 配置同步到运行时快照；有变化时递增代数。
+
+    返回 (快照副本, 当前代数)。
+    """
+    global _runtime_llm, _runtime_llm_generation
+    try:
+        current = _current_llm_settings()
+    except Exception as error:
+        logger.warning("读取运行时 LLM 配置失败，沿用上次快照: %s", error)
+        current = None
+    with _runtime_llm_lock:
+        if current is not None and current != _runtime_llm:
+            _runtime_llm = current
+            _runtime_llm_generation += 1
+            logger.info(
+                "运行时 LLM 配置已更新: provider=%s, base_url=%s, model=%s, models=%s",
+                current.get("provider"), current.get("base_url"),
+                current.get("model"), current.get("available_models"),
+            )
+        return dict(_runtime_llm), _runtime_llm_generation
+
+
+def _runtime_llm_snapshot() -> Dict[str, Any]:
+    return _refresh_runtime_llm()[0]
+
 
 def resolve_model(model: Optional[str] = None) -> str:
-    selected = (model or MODEL).strip()
-    if selected not in AVAILABLE_MODELS:
-        raise HTTPException(status_code=400, detail=f"Unsupported model: {selected}")
+    runtime = _runtime_llm_snapshot()
+    available = runtime.get("available_models") or []
+    default_model = runtime.get("model") or MODEL
+    selected = (model or default_model).strip()
+    if selected not in available:
+        # 供应商切换后旧会话里保存的模型可能已不在新列表：回退到当前默认模型，
+        # 而不是 400，保证切换供应商后聊天可以继续。
+        logger.info(
+            "模型 %r 不在当前可用列表 %s，回退到默认模型 %r",
+            selected, available, default_model,
+        )
+        return default_model
     return selected
 
 
 def apply_agent_model(agent: Any, model: str):
     if hasattr(agent, "set_model"):
         agent.set_model(model)
+    # 逐模型上下文容量：切换模型后同步调整 ContextManager 上限
+    try:
+        runtime = _runtime_llm_snapshot()
+        tokens = resolve_context_tokens(runtime, model)
+        inner = getattr(agent, "agent", agent)  # 兼容流式包装器
+        cm = getattr(inner, "context_manager", None)
+        if cm is not None and hasattr(cm, "set_max_context_tokens"):
+            cm.set_max_context_tokens(tokens)
+    except Exception as error:
+        logger.warning("应用逐模型上下文容量失败 (%s): %s", model, error)
 
 
 def get_stream_lifecycle_lock(session_id: str) -> threading.RLock:
@@ -360,14 +454,25 @@ def refresh_session_theme(session_id: str, seed_text: str) -> None:
 
 
 class ChatRequest(BaseModel):
-    message: str = Field(..., max_length=MAX_MESSAGE_LENGTH, description="用户消息内容")
+    message: str = Field("", max_length=MAX_MESSAGE_LENGTH, description="用户消息内容（可为空，需同时携带附件）")
     model: Optional[str] = Field(None, description="Model name")
-    
-    @field_validator('message')
+    attachments: Optional[List[str]] = Field(
+        None,
+        description="附件文件路径列表（经 POST /upload_media/{session_id} 上传后返回的 path）",
+    )
+
+    @field_validator("message")
     def validate_message(cls, v):
-        if not v or not v.strip():
-            raise ValueError('消息不能为空')
-        return v.strip()
+        return (v or "").strip()
+
+    @model_validator(mode="after")
+    def validate_message_or_attachments(self):
+        """消息与附件不可同时为空（原生多模态：允许"纯图片、无文字"消息）。"""
+        text = (self.message or "").strip()
+        attachments = [item for item in (self.attachments or []) if item]
+        if not text and not attachments:
+            raise ValueError("消息不能为空")
+        return self
 
 
 class CreateSessionRequest(BaseModel):
@@ -378,6 +483,165 @@ class CreateSessionRequest(BaseModel):
 
 class ModelRequest(BaseModel):
     model: str = Field(..., description="Model name")
+
+
+class LlmSettingsRequest(BaseModel):
+    """设置面板提交的 LLM 配置（空 api_key = 不修改密钥）。"""
+
+    provider: str = Field(..., min_length=1, description="供应商适配器名（见 xenon_core.providers）")
+    base_url: str = Field(..., min_length=1, description="API 地址，需以 http(s):// 开头")
+    api_key: str = Field("", max_length=4096, description="API 密钥；留空表示保持现状")
+    model: str = Field(..., min_length=1, description="默认模型名")
+    available_models: Optional[List[str]] = Field(None, description="可选模型列表")
+    model_contexts: Optional[Dict[str, int]] = Field(None, description="逐模型上下文容量 {模型名: token}")
+    context_max_tokens: int = Field(..., ge=8192, le=10_000_000, description="上下文容量（token）")
+    thinking_enabled: Optional[bool] = Field(None, description="是否启用 thinking（DeepSeek 等）")
+    thinking_mode: Optional[str] = Field(None, description="思考模式方言: auto/enabled_disabled/adaptive_disabled/off")
+    reasoning_effort: Optional[str] = Field(None, description="思考等级: 空=默认max, off/minimal/low/medium/high/max")
+    input_modalities: Optional[List[str]] = Field(
+        None, description="输入模态: text/image/video/audio（空=按模型名自动推断）"
+    )
+
+
+class LlmProfileRequest(BaseModel):
+    """新增/更新一个 LLM 配置档案（增量添加，同名覆盖）。"""
+
+    name: str = Field(..., min_length=1, max_length=64, description="档案名称（唯一标识）")
+    provider: str = Field(..., min_length=1, description="供应商适配器名")
+    base_url: str = Field(..., min_length=1, description="API 地址，需以 http(s):// 开头")
+    api_key: str = Field("", max_length=4096, description="API 密钥；留空表示保持现状（更新时）")
+    model: str = Field(..., min_length=1, description="默认模型名")
+    available_models: Optional[List[str]] = Field(None, description="可选模型列表")
+    model_contexts: Optional[Dict[str, int]] = Field(None, description="逐模型上下文容量 {模型名: token}")
+    context_max_tokens: int = Field(..., ge=8192, le=10_000_000, description="上下文容量（token）")
+    thinking_enabled: Optional[bool] = Field(None, description="是否启用 thinking")
+    thinking_mode: Optional[str] = Field(None, description="思考模式方言: auto/enabled_disabled/adaptive_disabled/off")
+    reasoning_effort: Optional[str] = Field(None, description="思考等级: 空=默认max, off/minimal/low/medium/high/max")
+    input_modalities: Optional[List[str]] = Field(
+        None, description="输入模态: text/image/video/audio（空=按模型名自动推断）"
+    )
+    activate: bool = Field(False, description="保存后是否立即激活该档案")
+
+
+class LlmActivateRequest(BaseModel):
+    """激活指定名称的配置档案。"""
+
+    name: str = Field(..., min_length=1, max_length=64, description="档案名称")
+
+
+class LlmTestRequest(BaseModel):
+    """模型连接性测试：用给定（或档案内保存的）凭据探测供应商可用性。"""
+
+    provider: str = Field(..., min_length=1, description="供应商适配器名")
+    base_url: str = Field(..., min_length=1, description="API 地址")
+    api_key: str = Field("", max_length=4096, description="API 密钥；留空时回退到档案/当前配置")
+    model: str = Field("", max_length=256, description="要探测的模型名（可空=只测连接与鉴权）")
+    profile_name: str = Field("", max_length=64, description="档案名：api_key 留空时取该档案已存密钥")
+
+
+def _mask_api_key(key: str) -> str:
+    """密钥脱敏：sk-***abcd。"""
+    if not key:
+        return ""
+    if len(key) <= 8:
+        return key[:2] + "***"
+    return key[:3] + "***" + key[-4:]
+
+
+def _current_llm_settings() -> Dict[str, Any]:
+    """读取当前生效的 LLM 配置（与 Xenon.py 同一来源）。"""
+    s = load_settings()
+    model = str(s.get("llm.model", "deepseek-v4-flash"))
+    available = list(dict.fromkeys(s.get("llm.available_models") or [model]))
+    if model not in available:
+        available.insert(0, model)
+    return {
+        "provider": str(s.get("llm.provider", "openai_compat")),
+        "base_url": str(s.get("llm.base_url", "https://api.deepseek.com")),
+        "api_key": str(s.get("llm.api_key", "")),
+        "model": model,
+        "available_models": available,
+        "model_contexts": normalize_model_contexts(
+            s.get("llm.model_contexts"), available
+        ),
+        "context_max_tokens": int(s.get("context.max_tokens_default", 1_000_000)),
+        "thinking_enabled": bool(s.get("llm.thinking_enabled", True)),
+        "thinking_mode": str(s.get("llm.thinking_mode", "auto") or "auto"),
+        "reasoning_effort": str(s.get("llm.reasoning_effort", "max") or "max"),
+        "input_modalities": normalize_input_modalities(s.get("llm.input_modalities")),
+    }
+
+
+def resolve_context_tokens(runtime: Dict[str, Any], model: Optional[str] = None) -> int:
+    """按模型解析上下文容量：优先逐模型配置，回退到默认容量。"""
+    default = int(runtime.get("context_max_tokens") or MAX_CONTEXT_TOKENS_DEFAULT)
+    contexts = runtime.get("model_contexts") or {}
+    if model and model in contexts:
+        try:
+            return int(contexts[model])
+        except (TypeError, ValueError):
+            return default
+    return default
+
+
+def _apply_llm_patch_to_config(
+    *,
+    provider: str,
+    base_url: str,
+    model: str,
+    api_key: str = "",
+    available_models: Optional[List[str]] = None,
+    model_contexts: Optional[Dict[str, int]] = None,
+    thinking_enabled: Optional[bool] = None,
+    thinking_mode: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+    input_modalities: Optional[List[str]] = None,
+    context_max_tokens: int,
+) -> Dict[str, Dict[str, bool]]:
+    """把 LLM 字段合并写回 xenon.yml（保留注释），返回变更明细。
+
+    供"保存当前配置"与"激活档案"两条路径复用。
+    """
+    llm_patch: Dict[str, Any] = {
+        "provider": provider,
+        "base_url": base_url,
+        "model": model,
+    }
+    if api_key.strip():
+        llm_patch["api_key"] = api_key.strip()
+    if available_models:
+        cleaned = [item.strip() for item in available_models if item.strip()]
+        if cleaned:
+            llm_patch["available_models"] = cleaned
+    if model_contexts is not None:
+        llm_patch["model_contexts"] = normalize_model_contexts(
+            model_contexts, available_models
+        )
+    if thinking_enabled is not None:
+        llm_patch["thinking_enabled"] = bool(thinking_enabled)
+    if thinking_mode:
+        llm_patch["thinking_mode"] = thinking_mode
+    if reasoning_effort is not None:
+        # 空串 = 跟随全局默认：显式写回历史默认 max，避免切换到无等级档案时残留旧值
+        llm_patch["reasoning_effort"] = reasoning_effort.strip() or "max"
+    if input_modalities is not None:
+        # 原生多模态（Phase 3）：写回输入模态（空列表 = 清除，运行时回退模型名启发式）
+        llm_patch["input_modalities"] = normalize_input_modalities(input_modalities)
+    patch = {
+        "llm": llm_patch,
+        "context": {"max_tokens_default": int(context_max_tokens)},
+    }
+    return update_user_config(patch)
+
+
+def _mask_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
+    """档案脱敏（密钥只留首尾），用于返回给前端。"""
+    return {
+        **profile,
+        "api_key_masked": _mask_api_key(str(profile.get("api_key") or "")),
+        "has_api_key": bool(profile.get("api_key")),
+    }
+
 
 
 def _sanitize_loaded_messages(messages: List[Dict[str, Any]], *, label: str, session_id: str) -> List[Dict[str, Any]]:
@@ -405,16 +669,42 @@ def _sanitize_loaded_messages(messages: List[Dict[str, Any]], *, label: str, ses
     return messages
 
 
+def _persist_session_state(session_id: str, context: List[Dict[str, Any]], full_context: List[Dict[str, Any]]) -> None:
+    """会话落盘（媒体安全）：list content → 文本占位 + attachments 元数据。
+
+    原生多模态 Phase 2：base64 绝不进入 webui/sessions/*.json（方案 §2 空间维度）；
+    附件元数据保留在消息上，供消息回放渲染缩略图。
+    """
+    db.save_session_state(
+        session_id,
+        messages_for_session_store(context or []),
+        messages_for_session_store(full_context or []),
+    )
+
+
 def get_or_create_agent(session_id: str) -> Any:
-    """获取或创建 agent 实例（线程安全）"""
+    """获取或创建 agent 实例（线程安全）。
+
+    运行时 LLM 配置（供应商/密钥/模型）变化时，自动丢弃旧实例并重建，
+    使设置面板里切换供应商/激活档案立即生效，无需重启进程。
+    """
+    runtime, generation = _refresh_runtime_llm()
     session = db.get_session(session_id) or {}
     model = resolve_model(session.get("model"))
 
     # 先检查是否存在
     agent = agent_instances.get(session_id)
     if agent is not None:
-        apply_agent_model(agent, model)
-        return agent
+        if getattr(agent, "_llm_generation", None) == generation:
+            apply_agent_model(agent, model)
+            return agent
+        # 配置代数变化：旧实例使用旧供应商/密钥，丢弃后重建
+        logger.info(
+            "LLM 配置已变化（gen %s -> %s），重建会话 %s 的 agent",
+            getattr(agent, "_llm_generation", None), generation, session_id[:8],
+        )
+        agent_instances.delete(session_id)
+        agent = None
     
     # 获取或创建该 session 的锁（原子操作，消除 TOCTOU 竞态）
     lock = agent_locks.get_or_setdefault(session_id, threading.RLock)
@@ -423,10 +713,18 @@ def get_or_create_agent(session_id: str) -> Any:
     with lock:
         agent = agent_instances.get(session_id)
         if agent is None:
-            agent = AIAgent()
+            agent = AIAgent(
+                api_key=runtime.get("api_key") or API_KEY,
+                base_url=runtime.get("base_url") or BASE_URL,
+                provider=runtime.get("provider") or "openai_compat",
+                model=runtime.get("model") or MODEL,
+                available_models=runtime.get("available_models") or list(AVAILABLE_MODELS),
+                max_context_tokens_default=resolve_context_tokens(runtime, model),
+            )
             if ENABLE_TOOL_FILE_WATCHER:
                 agent.tool_manager.start_file_watcher()
             wrapped_agent = create_stream_adapter(agent)
+            wrapped_agent._llm_generation = generation
             apply_agent_model(wrapped_agent, model)
             
             context = db.get_context(session_id)
@@ -438,7 +736,7 @@ def get_or_create_agent(session_id: str) -> Any:
             sanitized_full = _sanitize_loaded_messages(full_context, label="full_context", session_id=session_id)
             if sanitized_context is not context or sanitized_full is not full_context:
                 try:
-                    db.save_session_state(session_id, sanitized_context, sanitized_full)
+                    _persist_session_state(session_id, sanitized_context, sanitized_full)
                 except Exception as save_error:
                     logger.warning("Failed to persist sanitized context for %s: %s", session_id, save_error)
             context, full_context = sanitized_context, sanitized_full
@@ -458,7 +756,12 @@ async def get_or_create_agent_async(session_id: str) -> Any:
     return await asyncio.to_thread(get_or_create_agent, session_id)
 
 
-async def event_generator(session_id: str, user_input: str, stream_id: Optional[str] = None):
+async def event_generator(
+    session_id: str,
+    user_input: str,
+    stream_id: Optional[str] = None,
+    attachments: Optional[List[str]] = None,
+):
     if stream_id is None:
         stream_id = f"{session_id}_{uuid.uuid4().hex}"
         with get_stream_lifecycle_lock(session_id):
@@ -487,7 +790,7 @@ async def event_generator(session_id: str, user_input: str, stream_id: Optional[
             yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
             return
 
-        async for event in agent.stream_chat_async(user_input):
+        async for event in agent.stream_chat_async(user_input, attachments=attachments):
             event_count += 1
             if active_streams.get(session_id) != stream_id:
                 logger.info(
@@ -532,7 +835,7 @@ async def event_generator(session_id: str, user_input: str, stream_id: Optional[
             elif event.type == 'done':
                 context = agent.get_context()
                 full_context = agent.get_full_context()
-                db.save_session_state(session_id, context, full_context)
+                _persist_session_state(session_id, context, full_context)
                 yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
                 break
 
@@ -554,7 +857,7 @@ async def event_generator(session_id: str, user_input: str, stream_id: Optional[
             if agent is not None:
                 context = agent.get_context()
                 full_context = agent.get_full_context()
-                db.save_session_state(session_id, context, full_context)
+                _persist_session_state(session_id, context, full_context)
         except Exception as save_error:
             logger.warning(f"Failed to save context after stream error for session {session_id}: {save_error}")
         yield f"data: {json.dumps({'type': 'error', 'content': str(e)}, ensure_ascii=False)}\n\n"
@@ -670,7 +973,12 @@ app.mount("/assets", StaticFiles(directory=WEBUI_DIR), name="webui-assets")
 async def root():
     index_path = WEBUI_DIR / "index.html"
     if index_path.exists():
-        return HTMLResponse(index_path.read_text(encoding='utf-8'))
+        # no-store：保证浏览器始终加载最新 HTML，避免缓存旧页面导致
+        # 旧版设置弹框行为（点击弹框外部即关闭）继续出现。
+        return HTMLResponse(
+            index_path.read_text(encoding='utf-8'),
+            headers={"Cache-Control": "no-store"},
+        )
     return {"message": "Xenon Web UI API"}
 
 
@@ -706,11 +1014,386 @@ async def get_sessions():
 
 @app.get("/models")
 async def get_models():
+    # 返回当前生效配置（供应商切换/激活档案后立即反映），而非启动时的静态快照
+    runtime = _runtime_llm_snapshot()
     return {
-        "models": AVAILABLE_MODELS,
-        "default_model": MODEL,
+        "models": runtime.get("available_models") or list(AVAILABLE_MODELS),
+        "default_model": runtime.get("model") or MODEL,
         "app_version": APP_VERSION,
     }
+
+
+@app.get("/settings/llm")
+async def get_llm_settings():
+    """设置面板：返回当前 LLM 配置 + 可用供应商适配器 + 配置档案（密钥脱敏）。"""
+    try:
+        current = _current_llm_settings()
+        return {
+            "provider": current["provider"],
+            "providers": list(list_providers()),
+            "base_url": current["base_url"],
+            "api_key_masked": _mask_api_key(current["api_key"]),
+            "has_api_key": bool(current["api_key"]),
+            "model": current["model"],
+            "available_models": current["available_models"],
+            "model_contexts": current["model_contexts"],
+            "context_max_tokens": current["context_max_tokens"],
+            "thinking_enabled": current["thinking_enabled"],
+            "thinking_mode": current["thinking_mode"],
+            "reasoning_effort": current["reasoning_effort"],
+            "profiles": [_mask_profile(p) for p in llm_list_profiles()],
+            "active_profile": get_active_profile_name(),
+            "config_path": str(Path(__file__).resolve().parent.parent / "xenon.yml"),
+            "restart_required": False,  # 供应商/密钥/模型切换已支持运行时生效
+        }
+    except Exception as error:
+        logger.error("Error reading LLM settings: %s", error, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(error))
+
+
+@app.post("/settings/llm")
+async def save_llm_settings(request: LlmSettingsRequest):
+    """设置面板：校验并写回 xenon.yml（保留注释），运行时立即生效。
+
+    若存在激活档案，同步更新该档案（api_key 留空 = 保持档案内原密钥）。
+    """
+    try:
+        provider = request.provider.strip()
+        if provider not in list_providers():
+            raise HTTPException(status_code=400, detail=f"未知供应商适配器: {provider!r}（可用: {', '.join(list_providers())}）")
+        base_url = request.base_url.strip().rstrip("/")
+        if not (base_url.startswith("http://") or base_url.startswith("https://")):
+            raise HTTPException(status_code=400, detail="base_url 需以 http:// 或 https:// 开头")
+        model = request.model.strip()
+        if not model:
+            raise HTTPException(status_code=400, detail="模型名不能为空")
+        # 校验供应商可解析（fail-fast，避免保存后才在启动时报错）
+        resolve_client_class(provider)
+
+        changed = _apply_llm_patch_to_config(
+            provider=provider,
+            base_url=base_url,
+            model=model,
+            api_key=request.api_key,
+            available_models=request.available_models,
+            model_contexts=request.model_contexts,
+            thinking_enabled=request.thinking_enabled,
+            thinking_mode=request.thinking_mode,
+            reasoning_effort=request.reasoning_effort,
+            input_modalities=request.input_modalities,
+            context_max_tokens=request.context_max_tokens,
+        )
+
+        # 同步更新激活档案（若存在）
+        active_name = get_active_profile_name()
+        if active_name:
+            existing = llm_list_profiles()
+            for profile in existing:
+                if profile["name"] == active_name:
+                    llm_save_profile(
+                        {
+                            **profile,
+                            "name": active_name,
+                            "provider": provider,
+                            "base_url": base_url,
+                            "model": model,
+                            # api_key 留空 = 保持档案原密钥
+                            "api_key": request.api_key.strip() or profile.get("api_key", ""),
+                            "available_models": request.available_models or profile.get("available_models", []),
+                            "model_contexts": request.model_contexts
+                            if request.model_contexts is not None
+                            else profile.get("model_contexts", {}),
+                            "context_max_tokens": request.context_max_tokens,
+                            "thinking_enabled": request.thinking_enabled
+                            if request.thinking_enabled is not None
+                            else profile.get("thinking_enabled", True),
+                            "thinking_mode": request.thinking_mode
+                            or profile.get("thinking_mode", "auto"),
+                            "reasoning_effort": request.reasoning_effort
+                            if request.reasoning_effort is not None
+                            else profile.get("reasoning_effort", ""),
+                            "input_modalities": request.input_modalities
+                            if request.input_modalities is not None
+                            else profile.get("input_modalities", []),
+                        },
+                        activate=True,
+                    )
+                    break
+
+        logger.info("LLM 设置已保存: %s", changed)
+        _refresh_runtime_llm()
+        return {
+            "ok": True,
+            "message": "配置已保存并立即生效（下一次发送消息时使用新配置）",
+            "restart_required": False,
+            "changed": changed,
+        }
+    except HTTPException:
+        raise
+    except Exception as error:
+        logger.error("Error saving LLM settings: %s", error, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(error))
+
+
+@app.post("/settings/llm/profiles")
+async def save_llm_profile(request: LlmProfileRequest):
+    """增量添加/更新一个配置档案；activate=True 时同时激活（写回 xenon.yml）。"""
+    try:
+        provider = request.provider.strip()
+        if provider not in list_providers():
+            raise HTTPException(status_code=400, detail=f"未知供应商适配器: {provider!r}（可用: {', '.join(list_providers())}）")
+        base_url = request.base_url.strip().rstrip("/")
+        if not (base_url.startswith("http://") or base_url.startswith("https://")):
+            raise HTTPException(status_code=400, detail="base_url 需以 http:// 或 https:// 开头")
+        model = request.model.strip()
+        if not model:
+            raise HTTPException(status_code=400, detail="模型名不能为空")
+        resolve_client_class(provider)
+
+        # 更新时 api_key 留空 = 保持档案内原密钥
+        existing = llm_list_profiles()
+        previous = next((p for p in existing if p["name"] == request.name.strip()), None)
+        api_key = request.api_key.strip() or (previous.get("api_key", "") if previous else "")
+
+        profile = llm_save_profile(
+            {
+                "name": request.name.strip(),
+                "provider": provider,
+                "base_url": base_url,
+                "api_key": api_key,
+                "model": model,
+                "available_models": request.available_models or [],
+                "model_contexts": request.model_contexts
+                if request.model_contexts is not None
+                else (previous.get("model_contexts", {}) if previous else {}),
+                "context_max_tokens": request.context_max_tokens,
+                "thinking_enabled": request.thinking_enabled
+                if request.thinking_enabled is not None
+                else (previous.get("thinking_enabled", True) if previous else True),
+                "thinking_mode": request.thinking_mode
+                or (previous.get("thinking_mode", "auto") if previous else "auto"),
+                "reasoning_effort": request.reasoning_effort
+                if request.reasoning_effort is not None
+                else (previous.get("reasoning_effort", "") if previous else ""),
+                "input_modalities": request.input_modalities
+                if request.input_modalities is not None
+                else (previous.get("input_modalities", []) if previous else []),
+            },
+            activate=request.activate,
+        )
+
+        changed: Dict[str, Dict[str, bool]] = {}
+        if request.activate:
+            changed = _apply_llm_patch_to_config(
+                provider=profile["provider"],
+                base_url=profile["base_url"],
+                model=profile["model"],
+                api_key=profile.get("api_key", ""),
+                available_models=profile.get("available_models", []),
+                model_contexts=profile.get("model_contexts", {}),
+                thinking_enabled=profile.get("thinking_enabled", True),
+                thinking_mode=profile.get("thinking_mode", "auto"),
+                reasoning_effort=profile.get("reasoning_effort", ""),
+                input_modalities=profile.get("input_modalities", []),
+                context_max_tokens=profile["context_max_tokens"],
+            )
+            _refresh_runtime_llm()
+            message = "档案已保存并激活，立即生效"
+        else:
+            message = "档案已保存（未激活）"
+
+        return {
+            "ok": True,
+            "message": message,
+            "restart_required": False,
+            "profile": _mask_profile(profile),
+            "changed": changed,
+        }
+    except HTTPException:
+        raise
+    except Exception as error:
+        logger.error("Error saving LLM profile: %s", error, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(error))
+
+
+@app.post("/settings/llm/activate")
+async def activate_llm_profile(request: LlmActivateRequest):
+    """激活指定档案：写回 xenon.yml + 更新档案 active 标记，运行时立即生效。"""
+    try:
+        profile = llm_activate_profile(request.name.strip())
+        if profile is None:
+            raise HTTPException(status_code=404, detail=f"档案不存在: {request.name!r}")
+        changed = _apply_llm_patch_to_config(
+            provider=profile["provider"],
+            base_url=profile["base_url"],
+            model=profile["model"],
+            api_key=profile.get("api_key", ""),
+            available_models=profile.get("available_models", []),
+            model_contexts=profile.get("model_contexts", {}),
+            thinking_enabled=profile.get("thinking_enabled", True),
+            thinking_mode=profile.get("thinking_mode", "auto"),
+            reasoning_effort=profile.get("reasoning_effort", ""),
+            input_modalities=profile.get("input_modalities", []),
+            context_max_tokens=profile["context_max_tokens"],
+        )
+        _refresh_runtime_llm()
+        logger.info("LLM 档案已激活并写回 xenon.yml: %s (%s)", profile["name"], changed)
+        return {
+            "ok": True,
+            "message": f"已切换到「{profile['name']}」，立即生效（下一次发送消息时使用新配置）",
+            "restart_required": False,
+            "profile": _mask_profile(profile),
+            "changed": changed,
+        }
+    except HTTPException:
+        raise
+    except Exception as error:
+        logger.error("Error activating LLM profile: %s", error, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(error))
+
+
+@app.delete("/settings/llm/profiles/{name}")
+async def delete_llm_profile(name: str):
+    """删除指定档案（激活中的档案不可删除，需先切换）。"""
+    try:
+        if name == get_active_profile_name():
+            raise HTTPException(status_code=400, detail=f"「{name}」是当前激活档案，请先切换后再删除")
+        removed = llm_delete_profile(name)
+        if not removed:
+            raise HTTPException(status_code=404, detail=f"档案不存在: {name!r}")
+        return {"ok": True, "message": f"档案「{name}」已删除"}
+    except HTTPException:
+        raise
+    except Exception as error:
+        logger.error("Error deleting LLM profile: %s", error, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(error))
+
+
+def _probe_llm_connection(
+    *,
+    provider: str,
+    base_url: str,
+    api_key: str,
+    model: str,
+    timeout: float = 15.0,
+) -> Dict[str, Any]:
+    """同步探测供应商连接性（在线程池中调用）。
+
+    策略：
+    1. 客户端支持 models.list() 时先拉模型列表（免费、快速），验证网络+鉴权；
+    2. 指定了 model 时再发一次 max_tokens=1 的微型对话，验证模型真实可用；
+    3. 不支持 models.list 的适配器直接走第 2 步（未指定 model 时报"无法自动探测"）。
+    """
+    import time
+
+    client_cls = resolve_client_class(provider)
+    client = client_cls(api_key=api_key, base_url=base_url, timeout=timeout)
+    started = time.monotonic()
+    try:
+        models_count: Optional[int] = None
+        listed_models: List[str] = []
+        models_api = getattr(client, "models", None)
+        list_fn = getattr(models_api, "list", None) if models_api is not None else None
+        if callable(list_fn):
+            result = list_fn()
+            data = getattr(result, "data", None) or []
+            listed_models = [str(getattr(item, "id", "") or "") for item in data]
+            models_count = len(listed_models)
+
+        if model:
+            if listed_models and model not in listed_models:
+                # 列表可拉取但目标模型不在其中：仍尝试微型对话（部分供应商列表不全）
+                logger.info("模型 %r 不在供应商列表中，尝试直接对话探测", model)
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": "ping"}],
+                max_tokens=1,
+                stream=False,
+            )
+            latency_ms = int((time.monotonic() - started) * 1000)
+            reply = ""
+            try:
+                reply = str(response.choices[0].message.content or "")
+            except Exception:  # noqa: BLE001 - 响应形态异常不影响"连通了"的结论
+                pass
+            return {
+                "ok": True,
+                "latency_ms": latency_ms,
+                "models_count": models_count,
+                "message": f"模型「{model}」可用（{latency_ms}ms）",
+                "reply_preview": reply[:40],
+            }
+
+        latency_ms = int((time.monotonic() - started) * 1000)
+        if models_count is not None:
+            return {
+                "ok": True,
+                "latency_ms": latency_ms,
+                "models_count": models_count,
+                "message": f"连接成功，鉴权通过（{latency_ms}ms，供应商返回 {models_count} 个模型）",
+            }
+        return {
+            "ok": False,
+            "latency_ms": latency_ms,
+            "models_count": None,
+            "message": "该供应商适配器不支持自动探测，请填写模型名后再测试",
+        }
+    finally:
+        close_fn = getattr(client, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+@app.post("/settings/llm/test")
+async def test_llm_connection(request: LlmTestRequest):
+    """测试供应商/模型连接性，不修改任何配置。
+
+    api_key 留空时的回退顺序：指定档案的已存密钥 → 当前生效配置的密钥。
+    """
+    try:
+        provider = request.provider.strip()
+        if provider not in list_providers():
+            raise HTTPException(status_code=400, detail=f"未知供应商适配器: {provider!r}")
+        base_url = request.base_url.strip().rstrip("/")
+        if not (base_url.startswith("http://") or base_url.startswith("https://")):
+            raise HTTPException(status_code=400, detail="base_url 需以 http:// 或 https:// 开头")
+
+        api_key = request.api_key.strip()
+        if not api_key and request.profile_name.strip():
+            stored = llm_get_profile(request.profile_name.strip())
+            if stored:
+                api_key = str(stored.get("api_key") or "")
+        if not api_key:
+            api_key = _current_llm_settings().get("api_key", "")
+        if not api_key:
+            raise HTTPException(status_code=400, detail="缺少 API Key：请填写密钥，或先保存档案")
+
+        model = request.model.strip()
+        result = await asyncio.to_thread(
+            _probe_llm_connection,
+            provider=provider,
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception as error:  # noqa: BLE001 - 把供应商错误转成可读信息返回，而非 500
+        message = str(error) or error.__class__.__name__
+        # 截断过长的供应商报错（HTML/堆栈），取首行有效信息
+        first_line = next((ln for ln in message.splitlines() if ln.strip()), message)
+        logger.info("LLM 连接性测试失败: %s", first_line[:300])
+        return {
+            "ok": False,
+            "latency_ms": None,
+            "models_count": None,
+            "message": first_line[:300],
+        }
+
 
 
 @app.get("/health")
@@ -953,13 +1636,6 @@ async def get_session_usage(session_id: str):
                 if tools:
                     tools_json = json.dumps(tools, ensure_ascii=False)
                     tokens += tc.count_tokens(tools_json)
-                # 加上认知网络摘要（API 提交时会注入）
-                try:
-                    cognitive = getattr(inner, "cognitive_network_summary", "")
-                    if cognitive:
-                        tokens += tc.count_tokens(str(cognitive))
-                except Exception:
-                    pass
 
             limit = int(getattr(cm, "max_context_tokens", MAX_CONTEXT_TOKENS_DEFAULT) or MAX_CONTEXT_TOKENS_DEFAULT)
             if limit <= 0:
@@ -1003,11 +1679,30 @@ async def get_messages(session_id: str):
             role = msg.get('role', '')
             
             if role == 'user':
-                messages.append({
+                raw_content = msg.get('content', '')
+                if isinstance(raw_content, list):
+                    # 防御：老数据若残留 list content，文本化（媒体 → 占位）
+                    raw_content = content_to_safe_text(raw_content)
+                entry = {
                     'role': 'user',
                     'type': 'content',
-                    'content': msg.get('content', '')
-                })
+                    'content': raw_content
+                }
+                attachments = msg.get('attachments')
+                if isinstance(attachments, list) and attachments:
+                    entry['attachments'] = [
+                        {
+                            'name': item.get('name') or '',
+                            'url': (
+                                f"/media/{session_id}/{Path(str(item.get('path'))).name}"
+                                if item.get('path')
+                                else ''
+                            ),
+                        }
+                        for item in attachments
+                        if isinstance(item, dict)
+                    ]
+                messages.append(entry)
             
             elif role == 'assistant':
                 reasoning = msg.get('reasoning_content', '')
@@ -1053,6 +1748,73 @@ async def get_messages(session_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/upload_media/{session_id}")
+async def upload_media(session_id: str, files: List[UploadFile] = File(...)):
+    """上传图片附件（原生多模态 Phase 2）。
+
+    保存到 output/media_cache/<session_id>/；返回的 path 随
+    POST /chat/{session_id}（或 /queue）的 attachments 字段一起提交。
+    格式/大小校验复用 media_payload.store_uploaded_media（单一实现）。
+    """
+    try:
+        require_session_id(session_id)
+        session = db.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        incoming = [item for item in (files or []) if item is not None]
+        if not incoming:
+            raise HTTPException(status_code=400, detail="未收到文件")
+        if len(incoming) > MAX_ATTACHMENTS_PER_MESSAGE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"单次最多上传 {MAX_ATTACHMENTS_PER_MESSAGE} 张图片",
+            )
+
+        dest_dir = MEDIA_CACHE_DIR / session_id
+        uploaded: List[Dict[str, Any]] = []
+        for upload in incoming:
+            data = await upload.read()
+            path, error = store_uploaded_media(upload.filename or "upload", data, dest_dir)
+            if path is None:
+                raise HTTPException(status_code=400, detail=error or "上传失败")
+            uploaded.append(
+                {
+                    "path": str(path),
+                    "name": Path(upload.filename or path.name).name,
+                    "size": len(data),
+                }
+            )
+
+        logger.info("会话 %s 上传 %s 个媒体附件", session_id[:8], len(uploaded))
+        return {"files": uploaded}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error uploading media for session {session_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/media/{session_id}/{filename}")
+async def get_media_file(session_id: str, filename: str):
+    """读取会话上传的媒体文件（原生多模态 Phase 2：消息回放缩略图）。
+
+    仅允许 media_cache/<session_id>/ 下的直接子文件，杜绝路径穿越。
+    """
+    try:
+        require_session_id(session_id)
+        base = (MEDIA_CACHE_DIR / session_id).resolve()
+        target = (base / filename).resolve()
+        if target.parent != base or not target.is_file():
+            raise HTTPException(status_code=404, detail="Media not found")
+        return FileResponse(target)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error serving media for session {session_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/chat/{session_id}")
 async def chat(session_id: str, request: ChatRequest, background_tasks: BackgroundTasks):
     try:
@@ -1082,7 +1844,7 @@ async def chat(session_id: str, request: ChatRequest, background_tasks: Backgrou
             running_streams.set(session_id, stream_id)
         
         return StreamingResponse(
-            event_generator(session_id, request.message, stream_id),
+            event_generator(session_id, request.message, stream_id, attachments=request.attachments),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -1117,7 +1879,7 @@ async def queue_chat_message(session_id: str, request: ChatRequest):
             raise HTTPException(status_code=404, detail="Agent not found for this session")
 
         if hasattr(agent, 'queue_message'):
-            result = agent.queue_message(request.message)
+            result = agent.queue_message(request.message, attachments=request.attachments)
         else:
             raise HTTPException(status_code=500, detail="Agent does not support message queueing")
 
@@ -1197,7 +1959,48 @@ async def get_polling_status():
         return {"pending_count": 0}
 
 
+def _port_already_in_use(host: str, port: int) -> bool:
+    """快速检测端口是否已被占用（与 uvicorn 相同：不设 SO_REUSEADDR）。"""
+    import socket
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind((host, port))
+        return False
+    except OSError:
+        return True
+    finally:
+        sock.close()
+
+
+def _webui_already_running(host: str, port: int) -> bool:
+    """通过 /health 判断占用端口的进程是否就是本 WebUI。"""
+    import urllib.request
+
+    url = f"http://{host}:{port}/health"
+    try:
+        with urllib.request.urlopen(url, timeout=2) as resp:
+            return resp.status == 200 and b'"ok"' in resp.read(256)
+    except Exception:
+        return False
+
+
 def main():
+    # 预检端口：若已被占用，立刻给出明确提示后退出，
+    # 避免启动 5~8 秒后才在 uvicorn 绑定阶段报错闪退（终端“自动关闭”的根源）。
+    if _port_already_in_use(WEBUI_HOST, WEBUI_PORT):
+        if _webui_already_running(WEBUI_HOST, WEBUI_PORT):
+            print(
+                f"\n[Xenon WebUI] 服务已在运行：http://{WEBUI_HOST}:{WEBUI_PORT}/\n"
+                "无需重复启动；如需重启，请先关闭现有实例再运行本脚本。\n"
+            )
+        else:
+            print(
+                f"\n[Xenon WebUI] 端口 {WEBUI_PORT} 已被其他程序占用，"
+                f"且 http://{WEBUI_HOST}:{WEBUI_PORT}/health 无响应。\n"
+                "请先释放该端口，或通过环境变量 XENON_WEBUI_PORT 改用其他端口。\n"
+            )
+        sys.exit(1)
     uvicorn.run(
         app,
         host=WEBUI_HOST,

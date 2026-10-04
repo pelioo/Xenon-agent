@@ -20,11 +20,19 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+try:
+    from _async_common import async_capable, list_async_tasks as list_async_tasks_global
+except ImportError:  # 以 Tools.xxx 包方式导入时（测试/脚本）
+    from Tools._async_common import async_capable, list_async_tasks as list_async_tasks_global
+
 import requests
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+
+# 适合后台异步执行的重操作（语音识别，默认 auto 路由到后台）
+_ASR_ASYNC_ACTIONS = ("transcribe_audio", "transcribe_video")
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "asr_config.json"
 DEFAULT_API_BASE = "https://dashscope.aliyuncs.com/api/v1"
@@ -1495,9 +1503,20 @@ class ASRHandler:
 class ASRToolManager:
     """Xenon auto-discovery entry point for ASR tools."""
 
+    # auto 模式下默认走后台的重操作
+    _ASYNC_ACTIONS = _ASR_ASYNC_ACTIONS
+
     def __init__(self):
         self.handler = ASRHandler()
 
+    def list_async_tasks(self, include_done: bool = True) -> Dict[str, Any]:
+        """列出本模块所有后台异步任务状态。
+
+        :param include_done: 是否包含已完成任务（默认 True）。
+        """
+        return list_async_tasks_global(include_done)
+
+    @async_capable("transcribe_audio", async_actions=_ASR_ASYNC_ACTIONS, source="asr", scenario="transcribe_result")
     def transcribe_audio(
         self,
         audio_path: str,
@@ -1511,6 +1530,7 @@ class ASRToolManager:
         generate_json: bool = False,
         config_path: str = "",
         timeout: Optional[int] = None,
+        async_mode: str = "auto",
     ) -> Dict[str, Any]:
         """Transcribe an audio file using DashScope ASR.
 
@@ -1525,6 +1545,7 @@ class ASRToolManager:
         :param generate_json: Generate JSON transcript file.
         :param config_path: Optional config JSON path.
         :param timeout: Transcription timeout in seconds.
+        :param async_mode: auto/sync/async 异步路由（auto 时转写默认走后台）。
         """
         return self.handler.transcribe_audio(
             audio_path=audio_path,
@@ -1540,6 +1561,7 @@ class ASRToolManager:
             timeout=timeout,
         )
 
+    @async_capable("transcribe_video", async_actions=_ASR_ASYNC_ACTIONS, source="asr", scenario="transcribe_result")
     def transcribe_video(
         self,
         video_path: str,
@@ -1552,6 +1574,7 @@ class ASRToolManager:
         config_path: str = "",
         timeout: Optional[int] = None,
         extract_timeout: int = 1800,
+        async_mode: str = "auto",
     ) -> Dict[str, Any]:
         """Extract audio from video and transcribe it.
 
@@ -1565,6 +1588,7 @@ class ASRToolManager:
         :param config_path: Optional config JSON path.
         :param timeout: Transcription timeout.
         :param extract_timeout: FFmpeg extraction timeout.
+        :param async_mode: auto/sync/async 异步路由（auto 时转写默认走后台）。
         """
         return self.handler.transcribe_video(
             video_path=video_path,

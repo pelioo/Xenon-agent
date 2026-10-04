@@ -24,6 +24,15 @@ import zipfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+try:
+    from _async_common import async_capable, list_async_tasks as list_async_tasks_global
+except ImportError:  # 以 Tools.xxx 包方式导入时（测试/脚本）
+    from Tools._async_common import async_capable, list_async_tasks as list_async_tasks_global
+
+
+# 适合后台异步执行的重操作（打包/归档，默认 auto 路由到后台）
+_PACKAGER_ASYNC_ACTIONS = ("package_project", "create_archive")
+
 
 DEFAULT_EXCLUDES = {
     ".git",
@@ -638,6 +647,9 @@ class ProgramPackager:
 
 
 class ProgramPackagerToolManager:
+    # auto 模式下默认走后台的重操作
+    _ASYNC_ACTIONS = _PACKAGER_ASYNC_ACTIONS
+
     def __init__(self) -> None:
         self.handler = ProgramPackager()
 
@@ -651,6 +663,13 @@ class ProgramPackagerToolManager:
     def check_dependencies(self) -> Dict[str, Any]:
         """Check local packaging toolchains such as Python, npm, Go, Cargo, dotnet, Maven, Gradle, and CMake."""
         return self.handler.check_dependencies()
+
+    def list_async_tasks(self, include_done: bool = True) -> Dict[str, Any]:
+        """列出本模块所有后台异步任务状态。
+
+        :param include_done: 是否包含已完成任务（默认 True）。
+        """
+        return list_async_tasks_global(include_done)
 
     def create_plan(
         self,
@@ -674,6 +693,7 @@ class ProgramPackagerToolManager:
         """
         return self.handler.create_plan(project_path, output_dir, targets, project_type, app_name, entry, archive)
 
+    @async_capable("package_project", async_actions=_PACKAGER_ASYNC_ACTIONS, source="program_packager", scenario="package_result")
     def package_project(
         self,
         project_path: str = ".",
@@ -685,6 +705,7 @@ class ProgramPackagerToolManager:
         dry_run: bool = True,
         archive: bool = True,
         timeout: int = 3600,
+        async_mode: str = "auto",
     ) -> Dict[str, Any]:
         """Package a project, or return the dry-run plan by default.
 
@@ -697,9 +718,11 @@ class ProgramPackagerToolManager:
         :param dry_run: When true, only return the plan and do not execute commands.
         :param archive: Add archive packaging when supported.
         :param timeout: Per-command timeout in seconds.
+        :param async_mode: auto/sync/async 异步路由（auto 时打包类操作默认走后台）。
         """
         return self.handler.package_project(project_path, output_dir, targets, project_type, app_name, entry, dry_run, archive, timeout)
 
+    @async_capable("create_archive", async_actions=_PACKAGER_ASYNC_ACTIONS, source="program_packager", scenario="archive_result")
     def create_archive(
         self,
         source_path: str,
@@ -707,6 +730,7 @@ class ProgramPackagerToolManager:
         format: str = "zip",
         include_patterns: Any = None,
         exclude_patterns: Any = None,
+        async_mode: str = "auto",
     ) -> Dict[str, Any]:
         """Create a zip/tar/tar.gz archive with common build and cache folders excluded.
 
@@ -715,6 +739,7 @@ class ProgramPackagerToolManager:
         :param format: zip, tar, tar.gz, or tgz.
         :param include_patterns: Optional glob pattern list.
         :param exclude_patterns: Optional glob pattern list or names to exclude.
+        :param async_mode: auto/sync/async 异步路由（auto 时归档操作默认走后台）。
         """
         return self.handler.create_archive(source_path, output_path, format, include_patterns, exclude_patterns)
 

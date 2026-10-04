@@ -24,15 +24,20 @@ PROJECT_ROOT = Path(__file__).parent.resolve()
 
 # 导出包含清单
 EXPORT_INCLUDE = [
-    "xenon_core",          # 目录
+    "xenon_core",          # 目录（含 P0-P5 新增：context/loader/settings/boot/exceptions/agent_runtime/plugins/）
     "webui",               # 目录
     "Tools",               # 目录
     "prompts",             # 目录
     "timer_app",           # 目录
+    "tests",               # 目录（P0-P5 单元测试：context/loader/settings/prompts/tool_metadata）
+    "docs",                # 目录（含 插件化改造设计草案.md）
     "Xenon.py",            # 文件
     "launcher.py",         # 文件
-    "deepseekconfig.py",   # 文件
+    "xenon.yml",           # 文件（P2 分层配置：用户配置层）
+    "xenon.profile.yml",   # 文件（P1 插件用户清单）
     "requirements.txt",    # 文件
+    "start_webui.bat",     # 文件
+    "start_webui.sh",      # 文件
     "start_Xenon.vbs",     # 文件
     "start_Terminal.bat",  # 文件
     "xenon_logo.ico",      # 文件
@@ -43,6 +48,14 @@ EXPORT_INCLUDE = [
 EXPORT_EXCLUDE = [
     "config",              # 含 API key，新安装自动创建
     "webui/sessions",      # 会话数据
+    "webui/webui_stdout.log",   # 运行时日志
+    "webui/webui_stderr.log",   # 运行时日志
+    "logs",                # 运行时日志（api_traces/heartbeat 等）
+    ".agent_history",      # 会话历史数据
+    "Context",             # 上下文运行时数据
+    "Memory",              # 记忆数据（含用户隐私）
+    "Tasks",               # 任务队列数据
+    "KnowledgeBase",       # 知识库数据
 ]
 
 # 通用排除模式（文件名/目录名匹配）

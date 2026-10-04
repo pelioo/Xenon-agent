@@ -2,7 +2,10 @@
 """
 DeepSeek 余额查询工具 — 调用官方 API 获取账户余额信息。
 
-依赖: deepseekconfig (项目根目录)
+配置来源: xenon_core.settings（xenon.yml 的 llm 配置；2026-08-16 起
+deepseekconfig.py 已移除，档案密钥由 WebUI 设置面板管理）。
+注意：余额接口是 DeepSeek 专有端点，仅当前配置指向 DeepSeek 时可用。
+
 API:  GET https://api.deepseek.com/user/balance
 文档: https://api-docs.deepseek.com/zh-cn/api/get-user-balance
 """
@@ -14,28 +17,17 @@ from typing import Dict, Any, Optional
 
 
 # -------------------------------------------------------------------------- #
-#  将项目根目录加入 path，以便 import deepseekconfig
+#  将项目根目录加入 path，以便 import xenon_core
 # -------------------------------------------------------------------------- #
-_PROJECT_ROOT = None
-for _p in [__file__, sys.argv[0] if sys.argv else None]:
-    if _p:
-        _root_candidate = __import__("os").path.dirname(__import__("os").path.dirname(__import__("os").path.abspath(_p)))
-        if __import__("os").path.isfile(__import__("os").path.join(_root_candidate, "deepseekconfig.py")):
-            _PROJECT_ROOT = _root_candidate
-            break
-if _PROJECT_ROOT and _PROJECT_ROOT not in sys.path:
+_PROJECT_ROOT = __import__("os").path.dirname(__import__("os").path.dirname(__import__("os").path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
-
-try:
-    import deepseekconfig as dsc
-except ImportError:
-    dsc = None  # type: ignore
 
 
 class DsBalanceToolManager:
     """DeepSeek 账户余额查询工具管理器
 
-    依赖: deepseekconfig.py（项目根目录）提供 API Key 和 Base URL。
+    配置来源: xenon_core.settings（llm.api_key / llm.base_url）。
     使用方式:
         load_module("ds_balance")
         result = ds_balance_DsBalanceToolManager_check_balance()
@@ -47,17 +39,24 @@ class DsBalanceToolManager:
 
     @staticmethod
     def _get_api_key() -> str:
-        """从 deepseekconfig 获取 API Key"""
-        if dsc is None:
-            raise RuntimeError("无法导入 deepseekconfig.py，请确认项目结构正确。")
-        if not dsc.API_KEY:
-            raise RuntimeError("DEEPSEEK_API_KEY 为空或未设置环境变量。")
-        return dsc.API_KEY
+        """从分层配置（xenon.yml / 环境变量）获取 API Key"""
+        from xenon_core.settings import load_settings
+
+        key = str(load_settings().get("llm.api_key", "") or "").strip()
+        if not key:
+            raise RuntimeError("未配置 API Key：请在 WebUI 设置面板中添加 DeepSeek 配置。")
+        return key
 
     @staticmethod
     def _get_base_url() -> str:
         """获取 API Base URL（默认 https://api.deepseek.com）"""
-        return (dsc.BASE_URL if dsc else "https://api.deepseek.com").rstrip("/")
+        try:
+            from xenon_core.settings import load_settings
+
+            base = str(load_settings().get("llm.base_url", "") or "")
+        except Exception:
+            base = ""
+        return (base or "https://api.deepseek.com").rstrip("/")
 
     # ---------------------------------------------------------------------- #
     #  对外接口

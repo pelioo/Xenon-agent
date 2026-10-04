@@ -156,8 +156,8 @@ if __name__ == "__main__":
                 "issues": [...],             ← 如果有问题，列出原因
                 "venv_exists": True/False,
                 "current_pid": 12345,
-                "project_root": "D:\\Xenon\\agent_Xenon",
-                "venv_python": "D:\\Xenon\\agent_Xenon\\venv\\Scripts\\python.exe",
+                "project_root": "&lt;PROJECT_ROOT&gt;",   ← 动态推导
+                "venv_python": "&lt;PROJECT_ROOT&gt;\\venv\\Scripts\\python.exe",
             }
         """
         venv_python = self._get_venv_python()

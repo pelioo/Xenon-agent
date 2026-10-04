@@ -146,16 +146,47 @@ def build_compact_tool_result_preview(
     return str(result)
 
 
+# 等待类工具的默认等待超时（与 Tools 层默认值一致；单位：秒）。
+# 仅注入"等待总时长"语义的 timeout，不触碰连接超时语义的工具（如 download 的
+# timeout 是 HTTP 连接超时，保持原默认，由框架级兜底负责）。
+_WAIT_TOOL_TIMEOUT_SUFFIXES = (
+    ("_ocr_wait", 300.0),
+    ("_download_wait", 300.0),
+)
+
+
+def _inject_default_wait_timeout(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """对等待类工具 setdefault(timeout)，防止 timeout=None 无限等待。
+
+    仅在调用方未显式传 timeout（键不存在）时注入；显式传值（含 null）不覆盖。
+    """
+    if not isinstance(arguments, dict):
+        return arguments
+    lowered = (tool_name or "").lower()
+    for suffix, default_timeout in _WAIT_TOOL_TIMEOUT_SUFFIXES:
+        if lowered.endswith(suffix):
+            result = dict(arguments)
+            result.setdefault("timeout", default_timeout)
+            return result
+    return arguments
+
+
 def sanitize_tool_arguments_for_execution(tool_name: str, arguments: Any) -> Any:
-    """Remove old compaction metadata keys without changing executable payloads."""
+    """Remove old compaction metadata keys without changing executable payloads.
+
+    同时对等待类工具（ocr_wait / download_wait）注入默认 timeout，
+    防止 timeout 缺失时无限等待（tool_runtime.py 与 tool_execution.py 两处
+    调用同时受益）。
+    """
     if not isinstance(arguments, dict):
         return arguments
 
-    return {
+    cleaned = {
         key: value
         for key, value in arguments.items()
         if key not in (WRITE_PAYLOAD_COMPACTED_KEY, TOOL_ARGUMENT_OMISSION_KEY)
     }
+    return _inject_default_wait_timeout(tool_name, cleaned)
 
 
 def compress_tool_messages_in_place(

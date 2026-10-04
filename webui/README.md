@@ -14,7 +14,7 @@
 ## 启动前提
 
 - 建议始终使用项目根目录下的虚拟环境启动：
-  - `venv\Scripts\python.exe`（项目根目录）
+  - `<项目根目录>\venv\Scripts\python.exe`
 - 确保项目根目录存在：
   - `deepseekconfig.py`
   - `Xenon.py`
@@ -28,11 +28,33 @@ venv\Scripts\python.exe -m pip install -r requirements.txt
 
 ### Windows
 
-在项目根目录双击 `start_Xenon.vbs`（无控制台窗口启动 launcher，图形界面选择 WebUI 模式），或在 `webui` 目录执行：
+在项目根目录执行：
+
+```bash
+start_webui.bat
+```
+
+或者在 `webui` 目录执行：
 
 ```bash
 start.bat
 ```
+
+### Linux / Termux
+
+在项目根目录执行：
+
+```bash
+sh start_webui.sh
+```
+
+也可以在 `webui` 目录执行：
+
+```bash
+sh start.sh
+```
+
+低性能设备建议保持默认的 `XENON_WEBUI_PREWARM=auto`：Termux 会跳过启动预热，普通 Linux 会把预热放到后台，避免浏览器打开时提示服务未就绪。
 
 ### 手动启动
 
@@ -41,8 +63,6 @@ start.bat
 ```bash
 venv\Scripts\python.exe webui\main.py
 ```
-
-> 旧版 `start_webui.bat` / `start_webui.sh` / `start.sh` 已移除，请使用上述方式启动。
 
 服务默认启动在 [http://localhost:8000](http://localhost:8000)。
 
@@ -61,8 +81,10 @@ venv\Scripts\python.exe webui\main.py
 - `POST /sessions`：创建会话
 - `DELETE /sessions/{session_id}`：删除会话
 - `GET /sessions/{session_id}/messages`：获取会话消息
-- `POST /chat/{session_id}`：发送消息并接收流式响应
+- `POST /chat/{session_id}`：发送消息并接收流式响应（支持 `attachments` 图片路径列表）
 - `POST /chat/{session_id}/stop`：停止生成
+- `POST /upload_media/{session_id}`：上传图片附件（返回服务器路径，供消息 `attachments` 引用）
+- `GET /media/{session_id}/{filename}`：读取会话已上传的媒体文件（消息回放缩略图）
 
 ## 目录结构
 

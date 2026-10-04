@@ -35,6 +35,23 @@ class StreamTransportError(RuntimeError):
     """Raised when the model stream ends because the HTTP transport broke."""
 
 
+class StrictTemplateError(RuntimeError):
+    """供应商模板拒绝消息结构（如非首位 system），需改消息形态后重试。"""
+
+
+STRICT_TEMPLATE_ERROR_MARKERS = (
+    "system message must be at the beginning",
+    "system message must be at the beginning of the conversation",
+    "jinja exception",
+)
+
+
+def is_strict_template_error(error: BaseException) -> bool:
+    """判断异常是否来自严格 Jinja 模板的角色位置校验。"""
+    text = str(error).lower()
+    return any(marker in text for marker in STRICT_TEMPLATE_ERROR_MARKERS)
+
+
 STREAM_TRANSPORT_ERROR_MARKERS = (
     "incomplete chunked read",
     "peer closed connection without sending complete message body",
@@ -271,8 +288,19 @@ def process_streaming_response(
                     }
                 )
             raise StreamTransportError(str(error)) from error
+        if is_strict_template_error(error):
+            # 严格模板（如本地 Qwen3.5 gguf）：上抛由 run_chat_cycle 折叠消息后重试
+            _close_response_safely(response)
+            logger.warning("供应商模板拒绝非首位 system 消息，将折叠后重试: %s", error)
+            raise StrictTemplateError(str(error)) from error
         logger.error("处理流式响应失败: %s", error)
         _safe_print(print_fn, f"\n错误: {error}")
+        # 同步到 WebUI 流：避免上游只收到空 done，表现为"模型没反应"
+        if stream_callback:
+            try:
+                stream_callback({"type": "error", "content": f"处理流式响应失败: {error}"})
+            except Exception:  # noqa: BLE001 - 回调失败不能再炸掉收尾
+                pass
 
 
 def process_non_streaming_response(

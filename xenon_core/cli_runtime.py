@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import logging
+import os
+import re
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Sequence, Type
 
+from xenon_core import media_payload
 from xenon_core.boot_report import render_cli_startup_report
 from xenon_core.runtime_health import collect_runtime_health
 
@@ -112,7 +115,7 @@ def run_interactive_agent_session(
                     continue
                 # ────────────────────────────────────────────────
 
-                agent.chat(user_input)
+                agent.chat(_normalize_attachment_tokens(user_input))
 
                 # ── 检查重启信号（由 restart_handler.restart_self() 设置）──
                 if _restart_signal_active():
@@ -183,6 +186,38 @@ def _read_user_input(
     if raw_input is None:
         return ""
     return raw_input.strip()
+
+
+_QUOTED_PATH_TOKEN_RE = re.compile(r'(?<![@\w])"([^"]+)"')
+
+
+def _normalize_attachment_tokens(user_input: str) -> str:
+    """CLI 附件语法规范化：拖拽/粘贴的引号路径 → ``@"path"`` 形式。
+
+    Windows 终端拖拽文件得到 ``"D:\\dir with space\\shot.png"`` 形式；
+    chat_entry 的统一解析器（media_payload.parse_attachments）支持
+    ``@"..."`` 语法。这里仅在引号内容为「真实存在的图片文件」时做语法
+    前置转换——识别、校验、编码仍在统一解析器内完成（单一实现）；
+    普通引号文本不受影响。
+    """
+    if not isinstance(user_input, str) or '"' not in user_input:
+        return user_input
+    extensions = media_payload.SUPPORTED_ATTACHMENT_EXTENSIONS
+
+    def _replace(match: "re.Match[str]") -> str:
+        raw = match.group(1)
+        try:
+            candidate = Path(os.path.expanduser(raw))
+            if not candidate.is_file() or candidate.suffix.lower() not in extensions:
+                return match.group(0)
+        except OSError:
+            return match.group(0)
+        return f'@"{raw}"'
+
+    try:
+        return _QUOTED_PATH_TOKEN_RE.sub(_replace, user_input)
+    except Exception:  # noqa: BLE001 - 规范化失败不影响原文
+        return user_input
 
 def _handle_autonomous_command(
     *,

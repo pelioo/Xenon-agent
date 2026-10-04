@@ -5,6 +5,7 @@ import hashlib
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
+from xenon_core.media_payload import build_user_content_safely
 from xenon_core.phase_policy import normalize_phase_state, router_phase_for
 
 
@@ -499,7 +500,8 @@ def run_autonomous_tick(
         cleanup_reasoning_content_fn(current_context)
         append_conversation_message_fn(
             current_context,
-            {"role": "user", "content": pending_input},
+            # 原生多模态（Phase 1）：排队消息中的 @附件引用统一解析为 content parts
+            {"role": "user", "content": build_user_content_safely(pending_input)},
         )
         try:
             process_chat_with_context_fn(pending_input, internal_context=None)

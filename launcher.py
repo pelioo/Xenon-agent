@@ -13,6 +13,11 @@ from pathlib import Path
 from tkinter import messagebox
 import tkinter as tk
 
+# ---------- 国内镜像源配置（可更换为其他源） ----------
+MIRROR_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
+# 阿里云：https://mirrors.aliyun.com/pypi/simple/
+# 中科大：https://pypi.mirrors.ustc.edu.cn/simple/
+# ---------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = PROJECT_ROOT / "config" / "launcher_settings.json"
@@ -23,7 +28,6 @@ VENV_PYTHON = VENV_DIR / ("Scripts/python.exe" if IS_WINDOWS else "bin/python")
 
 CREATE_NEW_CONSOLE = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-CHAT_API_KEY_ENV_NAMES = ("DEEPSEEK_API_KEY",)
 
 
 def load_settings() -> dict:
@@ -41,14 +45,6 @@ def save_settings(settings: dict) -> None:
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with CONFIG_PATH.open("w", encoding="utf-8") as handle:
         json.dump(settings, handle, ensure_ascii=False, indent=2)
-
-
-def first_env_value(names: tuple[str, ...]) -> str:
-    for name in names:
-        value = os.getenv(name)
-        if value:
-            return value
-    return ""
 
 
 def venv_python_path() -> Path:
@@ -76,7 +72,7 @@ class XenonLauncher(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Xenon 启动器")
-        self.geometry("530x390")
+        self.geometry("530x350")
         self.minsize(480, 340)
 
         self.settings = load_settings()
@@ -85,11 +81,6 @@ class XenonLauncher(tk.Tk):
         self.install_thread: threading.Thread | None = None
         self.terminal_process: subprocess.Popen | None = None
         self.webui_process: subprocess.Popen | None = None
-        credentials = self.settings.get("credentials") if isinstance(self.settings.get("credentials"), dict) else {}
-        saved_chat_key = credentials.get("chat_api_key") or self.settings.get("api_key", "")
-        self.chat_api_key_var = tk.StringVar(value=saved_chat_key or first_env_value(CHAT_API_KEY_ENV_NAMES))
-        self.secret_entries: list[tk.Entry] = []
-        self.show_key_var = tk.BooleanVar(value=False)
         self.host_var = tk.StringVar(value=self.settings.get("webui_host", "127.0.0.1"))
         self.port_var = tk.StringVar(value=str(self.settings.get("webui_port", "8000")))
         self.open_browser_var = tk.BooleanVar(value=self.settings.get("open_browser", True))
@@ -124,28 +115,6 @@ class XenonLauncher(tk.Tk):
         # ── 内容区 ──
         content = tk.Frame(self, bg="#e0d1b0", padx=20, pady=10)
         content.pack(fill="both", expand=True)
-
-        # ── 行1: api-key ──
-        row1 = tk.Frame(content, bg="#e0d1b0")
-        row1.pack(fill="x", pady=(0, 6))
-        tk.Label(row1, text="api-key", bg="#e0d1b0", fg="#594e14",
-                 font=("Microsoft YaHei", 10)).pack(side="left", padx=(0, 8))
-        api_frame = tk.Frame(row1, bg="#9f9770")
-        api_frame.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        api_entry = tk.Entry(
-            api_frame, textvariable=self.chat_api_key_var,
-            bg="#9f9770", fg="#ffffff", relief="flat",
-            font=("Consolas", 10), show="*",
-            insertbackground="#ffffff",
-        )
-        api_entry.pack(fill="both", expand=True)
-        self.secret_entries.append(api_entry)
-        tk.Button(
-            row1, text="保存", bg="#5d562c", fg="#f5f4ed",
-            relief="flat", font=("Microsoft YaHei", 9, "bold"),
-            padx=14, pady=2, bd=0,
-            command=self._save_settings_from_ui,
-        ).pack(side="left")
 
         # ── 行2: 依赖 + web-ui（同行排列） ──
         row2 = tk.Frame(content, bg="#e0d1b0")
@@ -208,13 +177,6 @@ class XenonLauncher(tk.Tk):
         opt_frame = tk.Frame(content, bg="#e0d1b0")
         opt_frame.pack(fill="x", pady=(0, 6))
         tk.Checkbutton(
-            opt_frame, text="显示密钥", variable=self.show_key_var,
-            bg="#e0d1b0", fg="#594e14", selectcolor="#e0d1b0",
-            activebackground="#e0d1b0", activeforeground="#594e14",
-            font=("Microsoft YaHei", 8), relief="flat",
-            command=self._toggle_api_visibility,
-        ).pack(side="left", padx=(0, 12))
-        tk.Checkbutton(
             opt_frame, text="启动WebUI后自动打开浏览器",
             variable=self.open_browser_var,
             bg="#e0d1b0", fg="#594e14", selectcolor="#e0d1b0",
@@ -236,23 +198,12 @@ class XenonLauncher(tk.Tk):
         self.log_text.pack(fill="both", expand=True)
         self.log_text.configure(state="disabled")
 
-    def _toggle_api_visibility(self) -> None:
-        show = "" if self.show_key_var.get() else "*"
-        for entry in self.secret_entries:
-            entry.configure(show=show)
-
     def _collect_settings(self) -> dict:
-        credentials = {}
-        chat_api_key = self.chat_api_key_var.get().strip()
-        if chat_api_key:
-            credentials["chat_api_key"] = chat_api_key
-        settings = {
+        return {
             "webui_host": self.host_var.get().strip() or "127.0.0.1",
             "webui_port": self.port_var.get().strip() or "8000",
             "open_browser": bool(self.open_browser_var.get()),
-            "credentials": credentials,
         }
-        return settings
 
     def _save_settings_from_ui(self) -> None:
         try:
@@ -267,10 +218,6 @@ class XenonLauncher(tk.Tk):
     def _build_child_env(self) -> dict[str, str]:
         settings = self._collect_settings()
         env = os.environ.copy()
-        credentials = settings.get("credentials", {})
-        chat_key = credentials.get("chat_api_key") or env.get("DEEPSEEK_API_KEY", "")
-        if chat_key:
-            env["DEEPSEEK_API_KEY"] = chat_key
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUTF8"] = "1"
         env["XENON_WEBUI_HOST"] = str(settings.get("webui_host", "127.0.0.1"))
@@ -283,9 +230,6 @@ class XenonLauncher(tk.Tk):
     def _validate_launch_ready(self) -> bool:
         if not venv_python_path().exists():
             messagebox.showwarning("缺少虚拟环境", "未找到 venv\\Scripts\\python.exe，请先点击安装按钮。")
-            return False
-        if not (self.chat_api_key_var.get().strip() or os.getenv("DEEPSEEK_API_KEY")):
-            messagebox.showwarning("缺少 API Key", "请先填写并保存 DeepSeek API Key。")
             return False
         return True
 
@@ -310,8 +254,20 @@ class XenonLauncher(tk.Tk):
                 self._log(f"使用现有虚拟环境：{venv_python_path()}")
 
             python = str(venv_python_path())
-            self._run_command([python, "-m", "pip", "install", "--upgrade", "pip"], "升级 pip")
-            self._run_command([python, "-m", "pip", "install", "-r", str(REQUIREMENTS_PATH)], "安装 requirements.txt")
+            if self._ensure_uv(python):
+                # uv 解析+下载，使用国内镜像源
+                self._run_command(
+                    [python, "-m", "uv", "pip", "install", "-r", str(REQUIREMENTS_PATH),
+                     "--python", python, "--index-url", MIRROR_INDEX_URL],
+                    "安装 requirements.txt（uv + 国内镜像）",
+                )
+            else:
+                self._log("uv 不可用，回退到 pip 安装，使用国内镜像源。")
+                self._run_command([python, "-m", "pip", "install", "--upgrade", "pip"], "升级 pip")
+                self._run_command(
+                    [python, "-m", "pip", "install", "-r", str(REQUIREMENTS_PATH), "-i", MIRROR_INDEX_URL],
+                    "安装 requirements.txt（pip + 国内镜像）"
+                )
             self._log("依赖安装完成。")
             self._post_ui(lambda: self.install_status_var.set("依赖状态：安装完成"))
         except Exception as exc:
@@ -319,6 +275,29 @@ class XenonLauncher(tk.Tk):
             self._post_ui(lambda: self.install_status_var.set("依赖状态：安装失败"))
         finally:
             self._post_ui(lambda: self.install_button.configure(state="normal"))
+
+    def _ensure_uv(self, python: str) -> bool:
+        """确保 venv 内 uv 可用：已有则直接用，没有则用 pip 装一次（使用国内镜像）。"""
+        try:
+            probe = subprocess.run(
+                [python, "-m", "uv", "--version"],
+                capture_output=True, timeout=30,
+                creationflags=CREATE_NO_WINDOW if IS_WINDOWS else 0,
+            )
+            if probe.returncode == 0:
+                self._log(f"uv 已可用：{probe.stdout.decode('utf-8', 'replace').strip()}")
+                return True
+        except Exception:
+            pass
+        try:
+            self._run_command(
+                [python, "-m", "pip", "install", "uv", "-i", MIRROR_INDEX_URL],
+                "安装 uv（一次性，使用国内镜像）"
+            )
+            return True
+        except Exception as exc:
+            self._log(f"uv 安装失败：{exc}")
+            return False
 
     def _run_command(self, args: list[str], title: str) -> None:
         self._log(f"开始：{title}")

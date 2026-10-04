@@ -1,5 +1,6 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -9,65 +10,14 @@ from xenon_core.execution_context import (
     ToolHealthChecker,
     create_default_context,
 )
+from xenon_core.context import XenonContext
 from xenon_core.delivery_closure import GitStatusProbe, DeliveryReport
 from xenon_core.multi_agent_runtime import MultiAgentRuntime
 
 
-def build_core_management_tools() -> Dict[str, Dict[str, Any]]:
-    return {
-        "load_module_tool": {
-            "type": "function",
-            "function": {
-                "name": "load_module",
-                "description": "加载指定模块的所有工具描述，加载后可直接使用该模块的全部工具。一次可加载多个模块。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "module_names": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "要加载的模块名称列表，如 ['code_editor_handler', 'terminal_handler']",
-                        }
-                    },
-                    "required": ["module_names"],
-                },
-            },
-        },
-        "tool_description_tool": {
-            "type": "function",
-            "function": {
-                "name": "get_tool_description",
-                "description": "获取指定工具的详细描述和参数信息。当某个工具不在已加载模块中时，可用此工具单独获取。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "tool_name": {
-                            "type": "string",
-                            "description": "工具名称，例如 terminal_handler_Terminal_get_system_info",
-                        }
-                    },
-                    "required": ["tool_name"],
-                },
-            },
-        },
-        "get_module_tools_tool": {
-            "type": "function",
-            "function": {
-                "name": "get_module_tools",
-                "description": "获取指定模块下的所有工具名称列表，不含详细参数。加载工具请使用 load_module。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "module_name": {
-                            "type": "string",
-                            "description": "模块名称，例如 terminal_handler",
-                        }
-                    },
-                    "required": ["module_name"],
-                },
-            },
-        },
-    }
+# build_core_management_tools 已迁至 xenon_core.tool_catalog（P4：由 tools 插件构建）；
+# 此处保留导入以便旧引用与回退路径使用。
+from xenon_core.tool_catalog import build_core_management_tools
 
 
 def initialize_context_manager(
@@ -137,7 +87,8 @@ def bootstrap_agent(
     agent.history_dir.mkdir(parents=True, exist_ok=True)
     agent.history_session_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
-    agent.tool_manager = tool_manager_cls()
+    # P4：tool_manager 不再在此创建——由 tools 插件在装配阶段构建，
+    # 装配完成后回填（见文件末尾 _wire_tools_after_plugins）。
     agent.task_chain_manager = task_chain_manager_cls()
     agent.memory_manager = memory_manager_cls(memory_dir=memory_dir, enable_network=False)
     agent.execution_journal = execution_journal_cls()
@@ -176,9 +127,6 @@ def bootstrap_agent(
     agent._autonomous_max_tool_failures = 3
     agent.multi_agent_runtime = MultiAgentRuntime()
     agent._multi_agent_default_subtasks = 2
-    inject_host_agent = getattr(agent.tool_manager, "inject_host_agent", None)
-    if callable(inject_host_agent):
-        inject_host_agent(agent)
 
     agent.context_manager = initialize_context_manager(
         context_manager_cls=context_manager_cls,
@@ -202,13 +150,10 @@ def bootstrap_agent(
     health_report = agent.health_checker.check_all()
     print_fn(agent.health_checker.format_report_console())
 
-    # Phase 4: 将沙箱上下文注入到 ToolManager 的各个 handler
-    inject_sandbox_context = getattr(agent.tool_manager, "inject_sandbox_context", None)
-    if callable(inject_sandbox_context):
-        injected = inject_sandbox_context(agent.sandbox_context)
-        print_fn(f"\033[38;2;111;208;104m[OK] Sandbox context injected to {injected} tool(s)\033[0m")
-    else:
-        print_fn("\033[93m[WARN] Tool manager does not support sandbox context injection.\033[0m")
+    # Phase 4: 工具健康检查
+    agent.health_checker = ToolHealthChecker()
+    health_report = agent.health_checker.check_all()
+    print_fn(agent.health_checker.format_report_console())
 
     # Phase 5: Git 状态感知
     agent.git_probe = GitStatusProbe()
@@ -216,9 +161,83 @@ def bootstrap_agent(
     print_fn(agent.git_probe.format_status_console())
     agent.delivery_report = DeliveryReport(agent.git_probe)
 
-    tools = build_core_management_tools()
-    agent.load_module_tool = tools["load_module_tool"]
-    agent.tool_description_tool = tools["tool_description_tool"]
-    agent.get_module_tools_tool = tools["get_module_tools_tool"]
     agent._stream_callback = None
+
+    # ── P0：容器服务登记（进程态）──────────────────────────────────
+    # 仅镜像现有 agent 属性（同一对象引用），行为零变化；
+    # AIAgent 上的同名属性保留为兼容代理，现有调用路径不受影响。
+    # 会话态/轮次态服务（session / task-chain / journal / recovery /
+    # orchestration / multi-agent）在后续阶段随插件迁移，此处不登记。
+    # tools / tools.meta 由 tools 插件在装配时注册（P4）。
+    ctx = XenonContext()
+    agent.ctx = ctx
+    ctx.provide("agent", agent)  # P5：agent-loop 插件据此构造运行期服务
+    ctx.provide("llm", agent.client)
+    ctx.provide("llm.routing", agent.routing_client)
+    ctx.provide("memory", agent.memory_manager)
+    ctx.provide("context", agent.context_manager)
+    ctx.provide("cognitive", agent.cognitive_network)
+    ctx.provide("sandbox", agent.sandbox_context)
+    ctx.provide("health", agent.health_checker)
+    ctx.provide("git", agent.git_probe)
+    ctx.provide("delivery", agent.delivery_report)
+
+    # ── P1：清单驱动插件装配 ──────────────────────────────────────
+    # 默认装配 = 现状行为：插件激活只注册服务/幂等启动，不改变现有调用路径。
+    # 回滚：XENON_PLUGINS=off 跳过装配；或清空 xenon.profile.yml。
+    from xenon_core.loader import load_profile, ProfileWatcher
+
+    try:
+        plugin_report = load_profile(ctx)
+    except Exception as error:
+        logger.error("插件装配失败: %s", error)
+        raise
+    for line in plugin_report.render():
+        print_fn(line)
+
+    # ── P3：清单热重载（按 id 差异；XENON_PROFILE_WATCH=off 关闭）──
+    if os.environ.get("XENON_PROFILE_WATCH", "").strip().lower() not in {"0", "false", "off", "no"}:
+        try:
+            watcher = ProfileWatcher(ctx)
+            if watcher.start():
+                watcher.on_reload(
+                    lambda report: print_fn("\n".join(report.render()))
+                )
+                agent.profile_watcher = watcher
+        except Exception as error:
+            logger.warning("插件清单热重载启动失败: %s", error)
+
+    # ── P4：工具层回填（tools 插件装配后）──────────────────────────
+    # tools 插件已注册 tools / tools.meta 服务；此处回填 agent 兼容代理，
+    # 并执行沙箱/宿主注入（与原 bootstrap 时序等效）。
+    # 回退：插件未装配（XENON_PLUGINS=off 或清单禁用 tools）时直接创建 ToolManager。
+    agent.tool_manager = ctx.get("tools")
+    meta_tools = ctx.get("tools.meta")
+    if agent.tool_manager is None:
+        agent.tool_manager = tool_manager_cls()
+        meta_tools = meta_tools or build_core_management_tools()
+
+    meta_tools = meta_tools or build_core_management_tools()
+    agent.load_module_tool = meta_tools["load_module_tool"]
+    agent.tool_description_tool = meta_tools["tool_description_tool"]
+    agent.get_module_tools_tool = meta_tools["get_module_tools_tool"]
+    agent.get_module_list_tool = meta_tools["get_module_list_tool"]
+
+    inject_host_agent = getattr(agent.tool_manager, "inject_host_agent", None)
+    if callable(inject_host_agent):
+        inject_host_agent(agent)
+
+    inject_sandbox_context = getattr(agent.tool_manager, "inject_sandbox_context", None)
+    if callable(inject_sandbox_context):
+        injected = inject_sandbox_context(agent.sandbox_context)
+        print_fn(f"\033[38;2;111;208;104m[OK] Sandbox context injected to {injected} tool(s)\033[0m")
+    else:
+        print_fn("\033[93m[WARN] Tool manager does not support sandbox context injection.\033[0m")
+
+    # ── P5：运行期服务回填（agent-loop 插件装配后）──────────────────
+    # AIAgent.__getattr__ 把所有运行期方法委托给 AgentRuntimeService。
+    # 回退：插件未装配（XENON_PLUGINS=off 或清单禁用 agent-loop）时直接构造。
+    from xenon_core.agent_runtime import AgentRuntimeService
+
+    agent.agent_runtime = ctx.get("agent-loop") or AgentRuntimeService(agent)
 

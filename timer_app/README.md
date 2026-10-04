@@ -19,7 +19,7 @@ timer_app.py 启动
 1. **确保 WebUI 正在运行**
 2. 启动定时器程序：
    ```bash
-   cd <项目根目录>   # 例如 D:\AI智能体软\Xenon-agent
+   cd <项目根目录>
    python timer_app\timer_app.py
    ```
 3. 首次启动自动创建「⏰ 定时任务」会话

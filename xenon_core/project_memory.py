@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from xenon_core import media_payload
 from xenon_core.model_request import build_chat_completion_kwargs
 
 LEGACY_SUMMARY_PREFIX = "auto_summary_"
@@ -73,7 +74,7 @@ def build_project_memory_text(
             [
                 "",
                 "=" * 50,
-                f"【用户当前问题】: {last_user_message.get('content', '')}",
+                f"【用户当前问题】: {media_payload.content_to_safe_text(last_user_message.get('content', ''))}",
             ]
         )
 
@@ -277,7 +278,7 @@ def build_summary_conversation(
 
     for message in messages[-recent_message_limit:]:
         role = message.get("role", "")
-        content = (message.get("content", "") or "").strip()
+        content = media_payload.content_to_safe_text(message.get("content", "")).strip()
 
         if role == "user" and content:
             snippet = content[:max_message_snippet]
@@ -409,7 +410,7 @@ def generate_rule_summary(
 
     for message in messages[-recent_message_limit:]:
         role = message.get("role", "")
-        content = (message.get("content", "") or "").replace("\n", " ").strip()
+        content = media_payload.content_to_safe_text(message.get("content", "")).replace("\n", " ").strip()
         reasoning = (message.get("reasoning_content", "") or "").replace("\n", " ").strip()
         if not content and not reasoning:
             continue

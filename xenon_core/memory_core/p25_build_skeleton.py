@@ -8,7 +8,7 @@ p25_build_skeleton.py — P2.5: 构建上层骨架 + 建立父子链接
   4. 构建/更新 L1 宇宙节点
 
 用法:
-    cd D:/Xenon/agent_Xenon
+    cd &lt;项目根目录&gt;   # 例如: cd Xenon-agent
     python xenon_core/memory_core/p25_build_skeleton.py [--dry-run]
 """
 

@@ -15,7 +15,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import asyncio
-from playwright.async_api import async_playwright, Browser, Page, BrowserContext
+from playwright.async_api import async_playwright, Browser
 
 # 网页解析和学术搜索
 import xml.etree.ElementTree as ET
@@ -591,7 +591,7 @@ class WebSearchTool:
             pass
 
     # ============================================================
-    # 搜索引擎搜索（DuckDuckGo — 免费，0 API key，0 配置）
+    # 搜索引擎搜索（多引擎并发竞速 — Bing / 360 / DuckDuckGo）
     # ============================================================
 
     def search_web(
@@ -601,92 +601,175 @@ class WebSearchTool:
         timeout: int = 15,
     ) -> Dict[str, Any]:
         """
-        使用 DuckDuckGo 搜索互联网（免费，0 API key，0 配置）
+        多引擎并发搜索互联网（Bing / 360 / DuckDuckGo 竞速）
+
+        同时发起 Bing、360、DuckDuckGo 三个引擎的搜索请求，
+        谁先成功返回就用谁的结果（winner-takes-all），
+        总延迟约等于最快引擎的延迟，不再被单个慢引擎拖累。
+        DuckDuckGo 使用短超时（3s），网络不可达时快速失败，不影响整体。
 
         :param query: 搜索关键词
         :param max_results: 最大结果数，默认10
-        :return: 包含搜索结果的字典
+        :param timeout: 总超时预算（秒），默认15
+        :return: 包含搜索结果的字典（含 engine_used 标记实际命中的引擎）
         """
         try:
             request_timeout = max(1, min(int(timeout), 60))
         except (TypeError, ValueError):
             request_timeout = 15
 
-        # 先用 DuckDuckGo（ddgs 库）
+        # 多引擎并发竞速：Bing（实测最快）+ 360（国内兜底）+ DDG（短超时）
+        engines = [
+            ("bing", lambda: self._search_bing(query, max_results, request_timeout)),
+            ("so360", lambda: self._search_so360(query, max_results, request_timeout)),
+            ("duckduckgo", lambda: self._search_ddg(query, max_results, min(request_timeout, 3))),
+        ]
+
+        errors = []
+        executor = ThreadPoolExecutor(max_workers=len(engines))
         try:
-            ddgs = DDGS(timeout=request_timeout)
-            raw_results = list(ddgs.text(query, max_results=max_results))
-            if raw_results:
-                results = []
-                for r in raw_results:
-                    results.append({
-                        "title": r.get("title", ""),
-                        "url": r.get("href", ""),
-                        "snippet": r.get("body", ""),
-                        "source": "duckduckgo",
-                    })
-                return {
-                    "success": True,
-                    "query": query,
-                    "total_results": len(results),
-                    "results": results,
-                    "method": "duckduckgo",
-                    "message": f"搜索完成，找到 {len(results)} 条结果"
-                }
-        except Exception as e:
-            ddg_error = str(e)
+            futures = {executor.submit(fn): name for name, fn in engines}
+            try:
+                for fut in as_completed(futures, timeout=request_timeout):
+                    name = futures[fut]
+                    try:
+                        result = fut.result()
+                    except Exception as e:
+                        errors.append(f"{name}: {e}")
+                        continue
+                    if result and result.get("success"):
+                        return result
+                    errors.append(f"{name}: 未返回结果")
+            except TimeoutError:
+                errors.append(f"整体超时（>{request_timeout}s）")
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
-        # DuckDuckGo 失败时回退到 Bing 爬虫
-        try:
-            session = self._get_session()
-            url = f"https://www.bing.com/search?q={urllib.parse.quote(query)}&count={min(max_results, 20)}"
+        return {
+            "success": False,
+            "query": query,
+            "error": "; ".join(errors) if errors else "所有引擎均失败",
+            "message": f"搜索失败（多引擎竞速，{len(engines)} 个引擎均未返回有效结果）",
+        }
 
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            }
+    def _search_bing(
+        self,
+        query: str,
+        max_results: int,
+        timeout: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Bing 搜索引擎（实测最快，主力引擎），失败时抛出异常由竞速层捕获"""
+        session = self._get_session()
+        url = f"https://www.bing.com/search?q={urllib.parse.quote(query)}&count={min(max_results, 20)}"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        }
+        resp = session.get(url, headers=headers, timeout=timeout)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        results = []
+        for li in soup.select('li.b_algo, .b_algo'):
+            title_el = li.select_one('h2 a')
+            snippet_el = li.select_one('.b_caption p, .b_lineclamp2')
+            cite_el = li.select_one('cite')
+            if title_el is None:
+                continue
+            results.append({
+                "title": title_el.get_text(strip=True),
+                "url": title_el.get('href', ''),
+                "snippet": snippet_el.get_text(strip=True) if snippet_el else '',
+                "display_url": cite_el.get_text(strip=True) if cite_el else '',
+                "source": "bing",
+            })
+            if len(results) >= max_results:
+                break
+        if not results:
+            return None
+        return {
+            "success": True,
+            "query": query,
+            "total_results": len(results),
+            "results": results,
+            "method": "bing",
+            "engine_used": "bing",
+            "message": f"搜索完成（bing），找到 {len(results)} 条结果",
+        }
 
-            resp = session.get(url, headers=headers, timeout=request_timeout)
-            resp.raise_for_status()
+    def _search_so360(
+        self,
+        query: str,
+        max_results: int,
+        timeout: int,
+    ) -> Optional[Dict[str, Any]]:
+        """360 搜索（国内可用，兜底引擎），失败时抛出异常由竞速层捕获"""
+        session = self._get_session()
+        url = f"https://www.so.com/s?q={urllib.parse.quote(query)}"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        }
+        resp = session.get(url, headers=headers, timeout=timeout)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        results = []
+        for li in soup.select('li.res-list'):
+            title_el = li.select_one('h3.res-title a, h3.g-title a, h3 a')
+            snippet_el = li.select_one('p.res-desc, .res-desc, p')
+            cite_el = li.select_one('cite')
+            if title_el is None:
+                continue
+            results.append({
+                "title": title_el.get_text(strip=True),
+                "url": title_el.get('href', ''),
+                "snippet": snippet_el.get_text(strip=True) if snippet_el else '',
+                "display_url": cite_el.get_text(strip=True) if cite_el else '',
+                "source": "so360",
+            })
+            if len(results) >= max_results:
+                break
+        if not results:
+            return None
+        return {
+            "success": True,
+            "query": query,
+            "total_results": len(results),
+            "results": results,
+            "method": "so360",
+            "engine_used": "so360",
+            "message": f"搜索完成（so360），找到 {len(results)} 条结果",
+        }
 
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            results = []
-
-            for li in soup.select('li.b_algo, .b_algo'):
-                title_el = li.select_one('h2 a')
-                snippet_el = li.select_one('.b_caption p, .b_lineclamp2')
-                cite_el = li.select_one('cite')
-
-                if title_el is None:
-                    continue
-
-                results.append({
-                    "title": title_el.get_text(strip=True),
-                    "url": title_el.get('href', ''),
-                    "snippet": snippet_el.get_text(strip=True) if snippet_el else '',
-                    "display_url": cite_el.get_text(strip=True) if cite_el else '',
-                    "source": "bing",
-                })
-
-                if len(results) >= max_results:
-                    break
-
-            return {
-                "success": True,
-                "query": query,
-                "total_results": len(results),
-                "results": results,
-                "method": "bing_fallback",
-                "message": f"搜索完成（Bing回退），找到 {len(results)} 条结果"
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "query": query,
-                "error": str(e),
-                "message": f"搜索失败（DuckDuckGo: {ddg_error}; Bing回退也失败: {str(e)}）"
-            }
+    def _search_ddg(
+        self,
+        query: str,
+        max_results: int,
+        timeout: int,
+    ) -> Optional[Dict[str, Any]]:
+        """DuckDuckGo 搜索引擎（ddgs 库，短超时快速失败），失败时抛出异常由竞速层捕获"""
+        ddgs = DDGS(timeout=timeout)
+        raw_results = list(ddgs.text(query, max_results=max_results))
+        if not raw_results:
+            return None
+        results = []
+        for r in raw_results:
+            results.append({
+                "title": r.get("title", ""),
+                "url": r.get("href", ""),
+                "snippet": r.get("body", ""),
+                "source": "duckduckgo",
+            })
+        return {
+            "success": True,
+            "query": query,
+            "total_results": len(results),
+            "results": results,
+            "method": "duckduckgo",
+            "engine_used": "duckduckgo",
+            "message": f"搜索完成（duckduckgo），找到 {len(results)} 条结果",
+        }
 
     # ============================================================
     # 学术论文搜索（arXiv / Semantic Scholar — 免费 API）
@@ -847,578 +930,6 @@ class WebSearchTool:
                 "source": "semantic_scholar",
                 "message": f"Semantic Scholar 搜索失败: {str(e)}"
             }
-
-    async def click_element(
-        self,
-        url: str,
-        selector: str,
-        wait_time: float = 1.0,
-        timeout: int = 30000
-    ) -> Dict[str, Any]:
-        """
-        点击页面元素
-
-        :param url: 目标网址
-        :param selector: CSS选择器
-        :param wait_time: 点击后等待时间（秒），默认1秒
-        :param timeout: 页面加载超时时间（毫秒），默认30000
-        :return: 包含操作结果的字典
-        """
-        try:
-            browser = await self._get_browser()
-            context = await browser.new_context()
-            page = await context.new_page()
-
-            start_time = time.time()
-
-            try:
-                await page.goto(url, timeout=timeout, wait_until='domcontentloaded')
-                await page.wait_for_selector(selector, timeout=timeout)
-                await page.click(selector)
-                await asyncio.sleep(wait_time)
-
-                elapsed_time = time.time() - start_time
-
-                return {
-                    "success": True,
-                    "url": url,
-                    "selector": selector,
-                    "action": "click",
-                    "elapsed_time": elapsed_time,
-                    "message": f"成功点击元素: {selector}"
-                }
-
-            finally:
-                await context.close()
-
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "url": url,
-                "selector": selector,
-                "message": f"点击元素失败: {str(e)}"
-            }
-
-    def click_element_sync(
-        self,
-        url: str,
-        selector: str,
-        wait_time: float = 1.0,
-        timeout: int = 30000
-    ) -> Dict[str, Any]:
-        """
-        点击页面元素（同步版本）
-
-        :param url: 目标网址
-        :param selector: CSS选择器
-        :param wait_time: 点击后等待时间（秒），默认1秒
-        :param timeout: 页面加载超时时间（毫秒），默认30000
-        :return: 包含操作结果的字典
-        """
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-        try:
-            return loop.run_until_complete(
-                self.click_element(url, selector, wait_time, timeout)
-            )
-        finally:
-            pass
-
-    async def fill_input(
-        self,
-        url: str,
-        selector: str,
-        text: str,
-        wait_time: float = 0.5,
-        timeout: int = 30000
-    ) -> Dict[str, Any]:
-        """
-        填写输入框
-
-        :param url: 目标网址
-        :param selector: CSS选择器
-        :param text: 要填写的文本
-        :param wait_time: 填写后等待时间（秒），默认0.5秒
-        :param timeout: 页面加载超时时间（毫秒），默认30000
-        :return: 包含操作结果的字典
-        """
-        try:
-            browser = await self._get_browser()
-            context = await browser.new_context()
-            page = await context.new_page()
-
-            start_time = time.time()
-
-            try:
-                await page.goto(url, timeout=timeout, wait_until='domcontentloaded')
-                await page.wait_for_selector(selector, timeout=timeout)
-                await page.fill(selector, text)
-                await asyncio.sleep(wait_time)
-
-                elapsed_time = time.time() - start_time
-
-                return {
-                    "success": True,
-                    "url": url,
-                    "selector": selector,
-                    "text": text,
-                    "action": "fill",
-                    "elapsed_time": elapsed_time,
-                    "message": f"成功填写输入框: {selector}"
-                }
-
-            finally:
-                await context.close()
-
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "url": url,
-                "selector": selector,
-                "message": f"填写输入框失败: {str(e)}"
-            }
-
-    def fill_input_sync(
-        self,
-        url: str,
-        selector: str,
-        text: str,
-        wait_time: float = 0.5,
-        timeout: int = 30000
-    ) -> Dict[str, Any]:
-        """
-        填写输入框（同步版本）
-
-        :param url: 目标网址
-        :param selector: CSS选择器
-        :param text: 要填写的文本
-        :param wait_time: 填写后等待时间（秒），默认0.5秒
-        :param timeout: 页面加载超时时间（毫秒），默认30000
-        :return: 包含操作结果的字典
-        """
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-        try:
-            return loop.run_until_complete(
-                self.fill_input(url, selector, text, wait_time, timeout)
-            )
-        finally:
-            pass
-
-    async def scroll_page(
-        self,
-        url: str,
-        scroll_pixels: int = 1000,
-        wait_time: float = 1.0,
-        timeout: int = 30000
-    ) -> Dict[str, Any]:
-        """
-        滚动页面
-
-        :param url: 目标网址
-        :param scroll_pixels: 滚动像素数，默认1000
-        :param wait_time: 滚动后等待时间（秒），默认1秒
-        :param timeout: 页面加载超时时间（毫秒），默认30000
-        :return: 包含操作结果的字典
-        """
-        try:
-            browser = await self._get_browser()
-            context = await browser.new_context()
-            page = await context.new_page()
-
-            start_time = time.time()
-
-            try:
-                await page.goto(url, timeout=timeout, wait_until='domcontentloaded')
-                await asyncio.sleep(wait_time)
-
-                await page.evaluate(f'window.scrollBy(0, {scroll_pixels})')
-                await asyncio.sleep(wait_time)
-
-                elapsed_time = time.time() - start_time
-
-                scroll_position = await page.evaluate('window.scrollY')
-
-                return {
-                    "success": True,
-                    "url": url,
-                    "scroll_pixels": scroll_pixels,
-                    "scroll_position": scroll_position,
-                    "action": "scroll",
-                    "elapsed_time": elapsed_time,
-                    "message": f"成功滚动页面 {scroll_pixels} 像素"
-                }
-
-            finally:
-                await context.close()
-
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "url": url,
-                "message": f"滚动页面失败: {str(e)}"
-            }
-
-    def scroll_page_sync(
-        self,
-        url: str,
-        scroll_pixels: int = 1000,
-        wait_time: float = 1.0,
-        timeout: int = 30000
-    ) -> Dict[str, Any]:
-        """
-        滚动页面（同步版本）
-
-        :param url: 目标网址
-        :param scroll_pixels: 滚动像素数，默认1000
-        :param wait_time: 滚动后等待时间（秒），默认1秒
-        :param timeout: 页面加载超时时间（毫秒），默认30000
-        :return: 包含操作结果的字典
-        """
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-        try:
-            return loop.run_until_complete(
-                self.scroll_page(url, scroll_pixels, wait_time, timeout)
-            )
-        finally:
-            pass
-
-    async def take_screenshot(
-        self,
-        url: str,
-        output_path: str,
-        full_page: bool = False,
-        wait_time: float = 2.0,
-        timeout: int = 30000
-    ) -> Dict[str, Any]:
-        """
-        截取页面截图
-
-        :param url: 目标网址
-        :param output_path: 输出文件路径
-        :param full_page: 是否截取整个页面，默认False
-        :param wait_time: 页面加载后等待时间（秒），默认2秒
-        :param timeout: 页面加载超时时间（毫秒），默认30000
-        :return: 包含操作结果的字典
-        """
-        try:
-            browser = await self._get_browser()
-            context = await browser.new_context()
-            page = await context.new_page()
-
-            start_time = time.time()
-
-            try:
-                await page.goto(url, timeout=timeout, wait_until='domcontentloaded')
-                await asyncio.sleep(wait_time)
-
-                await page.screenshot(path=output_path, full_page=full_page)
-
-                elapsed_time = time.time() - start_time
-
-                return {
-                    "success": True,
-                    "url": url,
-                    "output_path": output_path,
-                    "full_page": full_page,
-                    "action": "screenshot",
-                    "elapsed_time": elapsed_time,
-                    "message": f"成功截图保存到: {output_path}"
-                }
-
-            finally:
-                await context.close()
-
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "url": url,
-                "message": f"截图失败: {str(e)}"
-            }
-
-    def take_screenshot_sync(
-        self,
-        url: str,
-        output_path: str,
-        full_page: bool = False,
-        wait_time: float = 2.0,
-        timeout: int = 30000
-    ) -> Dict[str, Any]:
-        """
-        截取页面截图（同步版本）
-
-        :param url: 目标网址
-        :param output_path: 输出文件路径
-        :param full_page: 是否截取整个页面，默认False
-        :param wait_time: 页面加载后等待时间（秒），默认2秒
-        :param timeout: 页面加载超时时间（毫秒），默认30000
-        :return: 包含操作结果的字典
-        """
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-        try:
-            return loop.run_until_complete(
-                self.take_screenshot(url, output_path, full_page, wait_time, timeout)
-            )
-        finally:
-            pass
-
-    async def wait_for_element(
-        self,
-        url: str,
-        selector: str,
-        timeout: int = 30000
-    ) -> Dict[str, Any]:
-        """
-        等待元素出现
-
-        :param url: 目标网址
-        :param selector: CSS选择器
-        :param timeout: 等待超时时间（毫秒），默认30000
-        :return: 包含操作结果的字典
-        """
-        try:
-            browser = await self._get_browser()
-            context = await browser.new_context()
-            page = await context.new_page()
-
-            start_time = time.time()
-
-            try:
-                await page.goto(url, timeout=timeout, wait_until='domcontentloaded')
-
-                element = await page.wait_for_selector(selector, timeout=timeout)
-
-                elapsed_time = time.time() - start_time
-
-                return {
-                    "success": True,
-                    "url": url,
-                    "selector": selector,
-                    "action": "wait_for_element",
-                    "elapsed_time": elapsed_time,
-                    "message": f"成功找到元素: {selector}"
-                }
-
-            finally:
-                await context.close()
-
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "url": url,
-                "selector": selector,
-                "message": f"等待元素超时: {str(e)}"
-            }
-
-    def wait_for_element_sync(
-        self,
-        url: str,
-        selector: str,
-        timeout: int = 30000
-    ) -> Dict[str, Any]:
-        """
-        等待元素出现（同步版本）
-
-        :param url: 目标网址
-        :param selector: CSS选择器
-        :param timeout: 等待超时时间（毫秒），默认30000
-        :return: 包含操作结果的字典
-        """
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-        try:
-            return loop.run_until_complete(
-                self.wait_for_element(url, selector, timeout)
-            )
-        finally:
-            pass
-
-    async def execute_script(
-        self,
-        url: str,
-        script: str,
-        wait_time: float = 1.0,
-        timeout: int = 30000
-    ) -> Dict[str, Any]:
-        """
-        执行JavaScript代码
-
-        :param url: 目标网址
-        :param script: JavaScript代码
-        :param wait_time: 执行后等待时间（秒），默认1秒
-        :param timeout: 页面加载超时时间（毫秒），默认30000
-        :return: 包含操作结果的字典
-        """
-        try:
-            browser = await self._get_browser()
-            context = await browser.new_context()
-            page = await context.new_page()
-
-            start_time = time.time()
-
-            try:
-                await page.goto(url, timeout=timeout, wait_until='domcontentloaded')
-                await asyncio.sleep(wait_time)
-
-                result = await page.evaluate(script)
-
-                elapsed_time = time.time() - start_time
-
-                return {
-                    "success": True,
-                    "url": url,
-                    "script": script,
-                    "result": result,
-                    "action": "execute_script",
-                    "elapsed_time": elapsed_time,
-                    "message": f"成功执行JavaScript"
-                }
-
-            finally:
-                await context.close()
-
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "url": url,
-                "message": f"执行JavaScript失败: {str(e)}"
-            }
-
-    def execute_script_sync(
-        self,
-        url: str,
-        script: str,
-        wait_time: float = 1.0,
-        timeout: int = 30000
-    ) -> Dict[str, Any]:
-        """
-        执行JavaScript代码（同步版本）
-
-        :param url: 目标网址
-        :param script: JavaScript代码
-        :param wait_time: 执行后等待时间（秒），默认1秒
-        :param timeout: 页面加载超时时间（毫秒），默认30000
-        :return: 包含操作结果的字典
-        """
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-        try:
-            return loop.run_until_complete(
-                self.execute_script(url, script, wait_time, timeout)
-            )
-        finally:
-            pass
-
-    async def get_element_text(
-        self,
-        url: str,
-        selector: str,
-        timeout: int = 30000
-    ) -> Dict[str, Any]:
-        """
-        获取元素文本
-
-        :param url: 目标网址
-        :param selector: CSS选择器
-        :param timeout: 页面加载超时时间（毫秒），默认30000
-        :return: 包含操作结果的字典
-        """
-        try:
-            browser = await self._get_browser()
-            context = await browser.new_context()
-            page = await context.new_page()
-
-            start_time = time.time()
-
-            try:
-                await page.goto(url, timeout=timeout, wait_until='domcontentloaded')
-
-                element = await page.wait_for_selector(selector, timeout=timeout)
-                text = await element.inner_text()
-
-                elapsed_time = time.time() - start_time
-
-                return {
-                    "success": True,
-                    "url": url,
-                    "selector": selector,
-                    "text": text,
-                    "text_length": len(text),
-                    "action": "get_element_text",
-                    "elapsed_time": elapsed_time,
-                    "message": f"成功获取元素文本"
-                }
-
-            finally:
-                await context.close()
-
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "url": url,
-                "selector": selector,
-                "message": f"获取元素文本失败: {str(e)}"
-            }
-
-    def get_element_text_sync(
-        self,
-        url: str,
-        selector: str,
-        timeout: int = 30000
-    ) -> Dict[str, Any]:
-        """
-        获取元素文本（同步版本）
-
-        :param url: 目标网址
-        :param selector: CSS选择器
-        :param timeout: 页面加载超时时间（毫秒），默认30000
-        :return: 包含操作结果的字典
-        """
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-        try:
-            return loop.run_until_complete(
-                self.get_element_text(url, selector, timeout)
-            )
-        finally:
-            pass
 
     def browse_website(self, url: str, timeout: int = 10) -> Dict[str, Any]:
         """
@@ -2119,69 +1630,6 @@ class WebSearchTool:
             }
 
 
-def get_page_title(url: str, timeout: int = 10) -> Dict[str, Any]:
-    """
-    获取网页标题的独立函数
-
-    :param url: 目标网址
-    :param timeout: 请求超时时间（秒），默认10秒
-    :return: 包含页面标题信息的字典
-    """
-    tool = WebSearchTool()
-    result = tool.browse_website(url, timeout)
-
-    if result["success"]:
-        return {
-            "success": True,
-            "url": url,
-            "title": result["title"],
-            "message": f"成功获取网页标题: {result['title']}"
-        }
-    else:
-        return {
-            "success": False,
-            "url": url,
-            "error": result["error"],
-            "message": result["message"]
-        }
-
-
-def get_page_content_summary(url: str, max_length: int = 500, timeout: int = 10) -> Dict[str, Any]:
-    """
-    获取网页内容摘要的独立函数
-
-    :param url: 目标网址
-    :param max_length: 摘要最大长度，默认500字符
-    :param timeout: 请求超时时间（秒），默认10秒
-    :return: 包含页面内容摘要的字典
-    """
-    tool = WebSearchTool()
-    result = tool.browse_website(url, timeout)
-
-    if result["success"]:
-        content = result["content"]
-        if len(content) > max_length:
-            summary = content[:max_length] + "...(内容已截断)"
-        else:
-            summary = content
-
-        return {
-            "success": True,
-            "url": url,
-            "summary": summary,
-            "original_length": result["content_length"],
-            "summary_length": len(summary),
-            "message": f"成功获取网页内容摘要 ({len(summary)} 字符)"
-        }
-    else:
-        return {
-            "success": False,
-            "url": url,
-            "error": result["error"],
-            "message": result["message"]
-        }
-
-
 class WebSearchToolManager:
     """并发网页搜索工具管理器"""
 
@@ -2234,33 +1682,6 @@ class WebSearchToolManager:
             return self.tool.search_web_content(url, keyword, timeout)
         except Exception as e:
             return {"success": False, "error": f"搜索网页内容失败: {str(e)}"}
-
-    def get_page_title(self, url: str, timeout: int = 10) -> Dict[str, Any]:
-        """
-        获取网页标题
-
-        :param url: 目标网址
-        :param timeout: 请求超时时间（秒），默认10秒
-        :return: 包含页面标题信息的字典
-        """
-        try:
-            return get_page_title(url, timeout)
-        except Exception as e:
-            return {"success": False, "error": f"获取网页标题失败: {str(e)}"}
-
-    def get_page_content_summary(self, url: str, max_length: int = 500, timeout: int = 10) -> Dict[str, Any]:
-        """
-        获取网页内容摘要
-
-        :param url: 目标网址
-        :param max_length: 摘要最大长度，默认500字符
-        :param timeout: 请求超时时间（秒），默认10秒
-        :return: 包含页面内容摘要的字典
-        """
-        try:
-            return get_page_content_summary(url, max_length, timeout)
-        except Exception as e:
-            return {"success": False, "error": f"获取网页内容摘要失败: {str(e)}"}
 
     def concurrent_browse_websites(
         self,
@@ -2453,153 +1874,6 @@ class WebSearchToolManager:
         except Exception as e:
             return {"success": False, "error": f"并发搜索失败: {str(e)}"}
 
-    def click_element(
-        self,
-        url: str,
-        selector: str,
-        wait_time: float = 1.0,
-        timeout: int = 30000
-    ) -> Dict[str, Any]:
-        """
-        点击页面元素
-
-        :param url: 目标网址
-        :param selector: CSS选择器
-        :param wait_time: 点击后等待时间（秒），默认1秒
-        :param timeout: 页面加载超时时间（毫秒），默认30000
-        :return: 包含操作结果的字典
-        """
-        try:
-            return self.tool.click_element_sync(url, selector, wait_time, timeout)
-        except Exception as e:
-            return {"success": False, "error": f"点击元素失败: {str(e)}"}
-
-    def fill_input(
-        self,
-        url: str,
-        selector: str,
-        text: str,
-        wait_time: float = 0.5,
-        timeout: int = 30000
-    ) -> Dict[str, Any]:
-        """
-        填写输入框
-
-        :param url: 目标网址
-        :param selector: CSS选择器
-        :param text: 要填写的文本
-        :param wait_time: 填写后等待时间（秒），默认0.5秒
-        :param timeout: 页面加载超时时间（毫秒），默认30000
-        :return: 包含操作结果的字典
-        """
-        try:
-            return self.tool.fill_input_sync(url, selector, text, wait_time, timeout)
-        except Exception as e:
-            return {"success": False, "error": f"填写输入框失败: {str(e)}"}
-
-    def scroll_page(
-        self,
-        url: str,
-        scroll_pixels: int = 1000,
-        wait_time: float = 1.0,
-        timeout: int = 30000
-    ) -> Dict[str, Any]:
-        """
-        滚动页面
-
-        :param url: 目标网址
-        :param scroll_pixels: 滚动像素数，默认1000
-        :param wait_time: 滚动后等待时间（秒），默认1秒
-        :param timeout: 页面加载超时时间（毫秒），默认30000
-        :return: 包含操作结果的字典
-        """
-        try:
-            return self.tool.scroll_page_sync(url, scroll_pixels, wait_time, timeout)
-        except Exception as e:
-            return {"success": False, "error": f"滚动页面失败: {str(e)}"}
-
-    def take_screenshot(
-        self,
-        url: str,
-        output_path: str,
-        full_page: bool = False,
-        wait_time: float = 2.0,
-        timeout: int = 30000
-    ) -> Dict[str, Any]:
-        """
-        截取页面截图
-
-        :param url: 目标网址
-        :param output_path: 输出文件路径
-        :param full_page: 是否截取整个页面，默认False
-        :param wait_time: 页面加载后等待时间（秒），默认2秒
-        :param timeout: 页面加载超时时间（毫秒），默认30000
-        :return: 包含操作结果的字典
-        """
-        try:
-            return self.tool.take_screenshot_sync(url, output_path, full_page, wait_time, timeout)
-        except Exception as e:
-            return {"success": False, "error": f"截图失败: {str(e)}"}
-
-    def wait_for_element(
-        self,
-        url: str,
-        selector: str,
-        timeout: int = 30000
-    ) -> Dict[str, Any]:
-        """
-        等待元素出现
-
-        :param url: 目标网址
-        :param selector: CSS选择器
-        :param timeout: 等待超时时间（毫秒），默认30000
-        :return: 包含操作结果的字典
-        """
-        try:
-            return self.tool.wait_for_element_sync(url, selector, timeout)
-        except Exception as e:
-            return {"success": False, "error": f"等待元素失败: {str(e)}"}
-
-    def execute_script(
-        self,
-        url: str,
-        script: str,
-        wait_time: float = 1.0,
-        timeout: int = 30000
-    ) -> Dict[str, Any]:
-        """
-        执行JavaScript代码
-
-        :param url: 目标网址
-        :param script: JavaScript代码
-        :param wait_time: 执行后等待时间（秒），默认1秒
-        :param timeout: 页面加载超时时间（毫秒），默认30000
-        :return: 包含操作结果的字典
-        """
-        try:
-            return self.tool.execute_script_sync(url, script, wait_time, timeout)
-        except Exception as e:
-            return {"success": False, "error": f"执行JavaScript失败: {str(e)}"}
-
-    def get_element_text(
-        self,
-        url: str,
-        selector: str,
-        timeout: int = 30000
-    ) -> Dict[str, Any]:
-        """
-        获取元素文本
-
-        :param url: 目标网址
-        :param selector: CSS选择器
-        :param timeout: 页面加载超时时间（毫秒），默认30000
-        :return: 包含操作结果的字典
-        """
-        try:
-            return self.tool.get_element_text_sync(url, selector, timeout)
-        except Exception as e:
-            return {"success": False, "error": f"获取元素文本失败: {str(e)}"}
-
     # ============================================================
     # 搜索引擎搜索（包装方法）
     # ============================================================
@@ -2611,10 +1885,11 @@ class WebSearchToolManager:
         timeout: int = 15,
     ) -> Dict[str, Any]:
         """
-        使用 DuckDuckGo 搜索互联网（免费，0 API key，0 配置，失败时自动回退 Bing）
+        多引擎并发搜索互联网（Bing / 360 / DuckDuckGo 竞速，谁快用谁）
 
         :param query: 搜索关键词
         :param max_results: 最大结果数，默认10
+        :param timeout: 总超时预算（秒），默认15
         :return: 包含搜索结果的字典
         """
         try:

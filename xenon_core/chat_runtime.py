@@ -3,8 +3,15 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from xenon_core.model_request import build_chat_completion_kwargs
-from xenon_core.response_runtime import StreamTransportError
-from xenon_core.turn_compactor import sanitize_messages_for_api
+from xenon_core.response_runtime import (
+    StreamTransportError,
+    StrictTemplateError,
+    is_strict_template_error,
+)
+from xenon_core.turn_compactor import (
+    fold_non_leading_system_messages,
+    sanitize_messages_for_api,
+)
 
 
 def run_chat_cycle(
@@ -33,7 +40,13 @@ def run_chat_cycle(
     logger: Any,
     thinking_enabled: Optional[bool] = None,
     reasoning_effort: Optional[str] = None,
+    base_url: Optional[str] = None,
+    thinking_mode: Optional[str] = None,
     print_fn: Callable[..., Any] = print,
+    stream_error_fn: Optional[Callable[[str], None]] = None,
+    pre_fold_system_messages: bool = False,
+    on_strict_template_retry_fn: Optional[Callable[[], None]] = None,
+    apply_media_policy_fn: Optional[Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]] = None,
 ) -> None:
     if is_interrupted_fn():
         raise interrupted_exception_cls("用户中断")
@@ -70,6 +83,15 @@ def run_chat_cycle(
         preserve_current_toolchain=True,
         include_reasoning=bool(thinking_enabled),
     )
+    # 已知严格模板供应商（首次 500 后由回调标记）：直接预折叠，避免每次都
+    # 先失败一次再重试（LM Studio 日志里会一直刷 500）。
+    if pre_fold_system_messages:
+        api_messages = fold_non_leading_system_messages(api_messages)
+
+    # 原生多模态（Phase 1/3）：发送前媒体策略——最近 N 轮保留完整媒体、更早轮次
+    # → 展示占位（兜底 compact 链，幂等）；不支持图像的模型降级为文字占位（L4）。
+    if apply_media_policy_fn is not None:
+        api_messages = apply_media_policy_fn(api_messages)
 
     save_api_request_fn(model, api_messages, tools)
 
@@ -82,6 +104,8 @@ def run_chat_cycle(
             stream=enable_streaming,
             thinking_enabled=thinking_enabled,
             reasoning_effort=reasoning_effort,
+            base_url=base_url,
+            thinking_mode=thinking_mode,
         )
         response = retry_request_fn(
             create_completion_fn,
@@ -102,6 +126,8 @@ def run_chat_cycle(
                     stream=False,
                     thinking_enabled=thinking_enabled,
                     reasoning_effort=reasoning_effort,
+                    base_url=base_url,
+                    thinking_mode=thinking_mode,
                 )
                 fallback_response = retry_request_fn(
                     create_completion_fn,
@@ -116,8 +142,50 @@ def run_chat_cycle(
     except interrupted_exception_cls:
         raise
     except Exception as error:
+        # 严格模板供应商（本地 Qwen3.5 等 gguf）：只允许首条 system。
+        # 折叠非首位 system 消息（时间戳等）后整体重试一次，对用户无感。
+        if isinstance(error, StrictTemplateError) or is_strict_template_error(error):
+            logger.warning("严格模板供应商，折叠非首位 system 消息后重试: %s", error)
+            try:
+                folded_messages = fold_non_leading_system_messages(api_messages)
+                folded_kwargs = build_chat_completion_kwargs(
+                    model=model,
+                    messages=folded_messages,
+                    tools=tools,
+                    stream=enable_streaming,
+                    thinking_enabled=thinking_enabled,
+                    reasoning_effort=reasoning_effort,
+                    base_url=base_url,
+                    thinking_mode=thinking_mode,
+                )
+                folded_response = retry_request_fn(
+                    create_completion_fn,
+                    **folded_kwargs,
+                )
+                if enable_streaming:
+                    process_streaming_response_fn(folded_response, messages, tools)
+                    _capture_response_usage(folded_response, save_api_usage_fn)
+                else:
+                    process_non_streaming_response_fn(folded_response, messages, tools)
+                    _capture_response_usage(folded_response, save_api_usage_fn)
+                # 标记成功：让调用方记住该供应商需要预折叠，后续轮次不再先失败
+                if on_strict_template_retry_fn is not None:
+                    try:
+                        on_strict_template_retry_fn()
+                    except Exception:  # noqa: BLE001
+                        pass
+                return
+            except Exception as retry_error:  # noqa: BLE001 - 重试失败按原路径上报
+                error = retry_error
         logger.error("对话失败: %s", error)
         print_fn(f"\n错误: {error}")
+        # 把错误推到 WebUI 流式回调：否则上游只看到一个空 done，
+        # 表现为"模型没有反应"且无任何提示（2026-08-16 排障发现）。
+        if stream_error_fn is not None:
+            try:
+                stream_error_fn(f"对话失败: {error}")
+            except Exception:  # noqa: BLE001 - 回调失败不能再炸掉收尾逻辑
+                pass
     finally:
         set_in_api_call_fn(False)
 

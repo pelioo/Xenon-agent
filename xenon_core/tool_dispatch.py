@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional, Type
 
@@ -30,6 +30,7 @@ def handle_tool_call_batch(
     handle_load_module_fn: Callable[[str, str, List[Dict[str, Any]]], None],
     handle_get_tool_description_fn: Callable[[str, str, List[Dict[str, Any]]], None],
     handle_get_module_tools_fn: Callable[[str, str, List[Dict[str, Any]]], None],
+    handle_get_module_list_fn: Callable[[str, str, List[Dict[str, Any]]], None],
     handle_context_manager_tool_fn: Callable[[str, str, str, List[Dict[str, Any]], Optional[List[Dict[str, Any]]]], None],
     handle_execute_tool_fn: Callable[[str, str, str, List[Dict[str, Any]]], None],
     add_tool_message_fn: Callable[[List[Dict[str, Any]], str, str], None],
@@ -56,6 +57,8 @@ def handle_tool_call_batch(
                 handle_get_tool_description_fn(tool_call_id, arguments_str, messages)
             elif tool_name == "get_module_tools":
                 handle_get_module_tools_fn(tool_call_id, arguments_str, messages)
+            elif tool_name == "get_module_list":
+                handle_get_module_list_fn(tool_call_id, arguments_str, messages)
             elif tool_name.startswith("context_manager_tool_"):
                 handle_context_manager_tool_fn(tool_call_id, tool_name, arguments_str, messages, tools)
             elif is_tool_loaded_fn(tool_name) or is_single_tool_loaded_fn(tool_name):

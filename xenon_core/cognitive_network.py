@@ -88,10 +88,16 @@ class CognitiveNetworkState:
         self,
         network_path: Optional[str] = None,
         memory_api: Optional[MemoryAPI] = None,
+        max_age_days: float = 5.0,
     ):
         # network_path is retained for compatibility with older callers. The
         # cognitive index is now memory-only and is never persisted to disk.
         self._api = memory_api or create_api()
+
+        # Hard time window: only memories newer than max_age_days enter the
+        # cognitive state. Older entries are never injected, regardless of
+        # importance (recency is the dominant signal for working context).
+        self._max_age_days = max_age_days
 
         # in-memory index
         self._entries: List[Dict[str, Any]] = []   # scored memory entries
@@ -244,8 +250,14 @@ class CognitiveNetworkState:
             if _has_exclude_pattern(node.title) or _has_exclude_pattern(node.summary):
                 continue
             entry = self._node_to_entry(node)
-            if entry:
-                entries.append(entry)
+            if entry is None:
+                continue
+            # Hard recency window: drop anything older than max_age_days.
+            # Recency is the dominant signal for working context — stale
+            # memories should not surface even if they score high.
+            if entry.get("_days_old", 999.0) > self._max_age_days:
+                continue
+            entries.append(entry)
 
         # Deduplicate by summary
         seen = set()
@@ -370,15 +382,15 @@ class CognitiveNetworkState:
         importance = entry.get("importance", 1.0)
         days_old = entry.get("_days_old", 999.0)
 
-        # Recency boost
+        # Recency boost (aligned with the max_age_days=5 window: entries
+        # outside the window never reach scoring, so gradients only matter
+        # within the first 5 days).
         if days_old < 1:
             recency = 3.0
-        elif days_old < 7:
+        elif days_old < 3:
             recency = 2.5
-        elif days_old < 30:
-            recency = 1.5
-        elif days_old < 90:
-            recency = 0.5
+        elif days_old < 5:
+            recency = 2.0
         else:
             recency = 0.0
 

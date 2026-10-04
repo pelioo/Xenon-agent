@@ -24,6 +24,11 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from urllib.parse import urlparse
 
 try:
+    from _async_common import async_capable, list_async_tasks as list_async_tasks_global
+except ImportError:  # 以 Tools.xxx 包方式导入时（测试/脚本）
+    from Tools._async_common import async_capable, list_async_tasks as list_async_tasks_global
+
+try:
     from playwright.sync_api import Page, sync_playwright
 
     PLAYWRIGHT_AVAILABLE = True
@@ -36,6 +41,9 @@ except ImportError:  # pragma: no cover - exercised only on missing dependency
 DEFAULT_OUTPUT_DIR = Path("work") / "web_video_outputs"
 SUPPORTED_OUTPUT_FORMATS = {"mp4", "webm", "mov", "mkv"}
 VALID_WAIT_UNTIL = {"commit", "domcontentloaded", "load", "networkidle"}
+
+# 适合后台异步执行的重操作（页面渲染成视频，默认 auto 路由到后台）
+_WEB_RENDER_ASYNC_ACTIONS = ("render_page_to_video",)
 
 
 class WebVideoRenderer:
@@ -851,6 +859,9 @@ class WebVideoRenderer:
 class WebVideoRendererToolManager:
     """Tool manager exposed to Xenon."""
 
+    # auto 模式下默认走后台的重操作
+    _ASYNC_ACTIONS = _WEB_RENDER_ASYNC_ACTIONS
+
     def __init__(self):
         self.renderer = WebVideoRenderer()
 
@@ -867,6 +878,14 @@ class WebVideoRendererToolManager:
             headless=headless,
         )
 
+    def list_async_tasks(self, include_done: bool = True) -> Dict[str, Any]:
+        """列出本模块所有后台异步任务状态。
+
+        :param include_done: 是否包含已完成任务（默认 True）。
+        """
+        return list_async_tasks_global(include_done)
+
+    @async_capable("render_page_to_video", async_actions=_WEB_RENDER_ASYNC_ACTIONS, source="web_video_renderer", scenario="render_result")
     def render_page_to_video(
         self,
         source: str,
@@ -895,6 +914,7 @@ class WebVideoRendererToolManager:
         navigation_timeout: Any = 60,
         timeout: int = 1800,
         keep_intermediate: bool = False,
+        async_mode: str = "auto",
     ) -> Dict[str, Any]:
         """Render a URL or local HTML file to a video file.
 

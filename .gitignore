@@ -68,3 +68,8 @@ memory_log.txt
 *.log
 webui/提示词.txt
 xenon_core/deepseek_v3_tokenizer/
+
+# === Local Machine Only — 含本机路径/私密任务/将由面板写入密钥，勿提交 ===
+xenon.yml
+timer_app/config.json
+upgrade_manifest.json

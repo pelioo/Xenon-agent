@@ -6,6 +6,8 @@ import json
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from xenon_core import media_payload
+
 
 _DROP_MESSAGE_KEYS = {
     "debug",
@@ -19,6 +21,8 @@ _DROP_MESSAGE_KEYS = {
     "tool_schema",
     "tool_schemas",
     "tools",
+    # 原生多模态：WebUI 会话回放元数据（仅用于消息展示缩略图，绝不进 API 请求）
+    "attachments",
 }
 
 _TOO_SHORT_FINALS = {
@@ -58,6 +62,24 @@ _TOOL_ACTION_CLAIM_RE = re.compile(
 
 _TOOL_ACTION_CLAIM_MAX_CHARS = 180
 _TOOL_ACTION_CLAIM_MAX_NONEMPTY_LINES = 3
+
+_DSML_BLOCK_START = "<tool_calls>"
+
+
+def strip_dsml_blocks(text: str) -> str:
+    """Remove leaked DSML tool-call blocks from assistant text.
+
+    Some model responses leak raw DSML markup (``<tool_calls>…</tool_calls>``)
+    into the visible assistant content.  Complete blocks and unclosed tails
+    are stripped together with their surrounding whitespace so the remaining
+    text stays clean.
+    """
+    if not text or _DSML_BLOCK_START not in text:
+        return text
+    cleaned = re.sub(r"\s*<tool_calls>.*?</tool_calls>\s*", "", text, flags=re.S)
+    if _DSML_BLOCK_START in cleaned:
+        cleaned = re.sub(r"\s*<tool_calls>.*$", "", cleaned, flags=re.S)
+    return cleaned
 
 _CHECKPOINT_SYSTEM_PREFIX = "【任务状态检查点】"
 _QUESTION_TIMESTAMP_PREFIX = "提问时间："
@@ -115,9 +137,16 @@ def compact_turn_for_next_context(turn_messages: list[dict]) -> list[dict]:
     输出：下一轮允许携带的极简消息，只保留用户提问和最终成果回复；
     若当轮带有提问时间/回答完成时间 system 消息，一并保留，
     让时间戳随轮次在历史中沉淀（模型由此感知时间流动）。
+
+    当轮可能出现多条 assistant 回复（例如：长回复附带工具调用，工具结果
+    返回后又补一条短收尾）。若只保留最后一条，长回复会被短收尾"吞掉"，
+    下一轮 API 上下文里只剩一句无关紧要的收尾。因此取轮内最有实质内容的
+    assistant 回复（多条时取最长者，等长时取靠后者）。
     """
-    user_content, last_user_index = _find_last_message_content(turn_messages, "user")
-    assistant_content, last_assistant_index = _find_last_assistant_content(turn_messages)
+    user_content, last_user_index = _find_last_user_content(turn_messages)
+    user_text = _content_to_text(user_content).strip() if user_content else ""
+    assistant_content, last_assistant_index = _find_best_assistant_content(turn_messages)
+    assistant_content = strip_dsml_blocks(assistant_content)
     has_tool_evidence = _has_tool_evidence(turn_messages, start_index=last_user_index)
 
     if _assistant_content_too_short(assistant_content):
@@ -125,7 +154,7 @@ def compact_turn_for_next_context(turn_messages: list[dict]) -> list[dict]:
     elif (
         assistant_content
         and not has_tool_evidence
-        and _turn_needs_tool_evidence(user_content)
+        and _turn_needs_tool_evidence(user_text)
         and _looks_like_tool_action_claim(assistant_content)
     ):
         assistant_content = ""
@@ -134,7 +163,7 @@ def compact_turn_for_next_context(turn_messages: list[dict]) -> list[dict]:
         turn_messages, last_user_index, last_assistant_index
     )
 
-    compact_messages: List[Dict[str, str]] = []
+    compact_messages: List[Dict[str, Any]] = []
     if question_timestamp and (user_content or assistant_content):
         compact_messages.append({"role": "system", "content": question_timestamp})
     if user_content:
@@ -217,6 +246,10 @@ def sanitize_messages_for_api(
             continue
         if role not in {"system", "user", "assistant", "tool"}:
             continue
+        # 提问时间/回答完成时间 system 消息按用户要求（2026-08-19）不再发送给 API；
+        # 旧会话历史中已沉淀的时间戳在此统一剔除。
+        if role == "system" and _is_timestamp_system_message(message):
+            continue
 
         cleaned: Dict[str, Any] = {}
         for key, value in message.items():
@@ -245,6 +278,62 @@ def sanitize_messages_for_api(
         sanitized.append(cleaned)
 
     return sanitized
+
+
+def fold_non_leading_system_messages(messages: list[dict]) -> list[dict]:
+    """把非首位的 system 消息折叠进相邻消息，适配严格 Jinja 模板的供应商。
+
+    部分本地模型模板（如 Qwen3.5 系 gguf 在 LM Studio/llama.cpp 中）只允许
+    首条消息是 system，遇到时间戳 system 消息会直接 500：
+    "System message must be at the beginning"。
+
+    折叠规则（返回新列表，不改原列表，仅在发送副本上使用）：
+    - 开头连续的 system 合并为一条（\\n\\n 连接）；
+    - 之后的 system（提问时间/回答完成时间等）以「（内容）」前缀并入下一条
+      user 消息；若后面没有 user，则并入前一条消息末尾。
+    """
+    if not messages:
+        return messages
+    folded: List[Dict[str, Any]] = []
+    for message in messages:
+        folded.append(copy.deepcopy(message))
+
+    # 1) 合并开头连续的 system
+    leading_texts: List[str] = []
+    idx = 0
+    while idx < len(folded) and folded[idx].get("role") == "system":
+        leading_texts.append(str(folded[idx].get("content") or ""))
+        idx += 1
+    if idx > 1:
+        merged = {"role": "system", "content": "\n\n".join(t for t in leading_texts if t)}
+        folded = [merged] + folded[idx:]
+
+    # 2) 折叠中段/末尾的 system
+    result: List[Dict[str, Any]] = []
+    pending_system_texts: List[str] = []
+    for pos, message in enumerate(folded):
+        if pos == 0 and message.get("role") == "system":
+            result.append(message)
+            continue
+        if message.get("role") == "system":
+            pending_system_texts.append(str(message.get("content") or ""))
+            continue
+        if pending_system_texts:
+            prefix = "".join(f"（{t}）\n" for t in pending_system_texts if t)
+            if message.get("role") == "user" and isinstance(message.get("content"), str):
+                message["content"] = prefix + "\n" + message["content"]
+                pending_system_texts = []
+            else:
+                # 非 user 消息：先冲刷到前一条消息末尾，避免错位
+                if result and isinstance(result[-1].get("content"), str):
+                    result[-1]["content"] += "\n" + prefix.rstrip("\n")
+                pending_system_texts = []
+        result.append(message)
+    # 末尾仍挂着 system（极少见）：并入最后一条消息
+    if pending_system_texts and result and isinstance(result[-1].get("content"), str):
+        suffix = "".join(f"（{t}）" for t in pending_system_texts if t)
+        result[-1]["content"] += "\n" + suffix
+    return result
 
 
 def trim_compact_history(messages: list[dict], max_turns: int) -> list[dict]:
@@ -282,6 +371,23 @@ def trim_compact_history(messages: list[dict], max_turns: int) -> list[dict]:
     return state_messages + body_messages[cut_index:]
 
 
+def _find_last_user_content(messages: list[dict]) -> Tuple[Any, int]:
+    """返回最后一条 user 消息的原始 content（str 或 content parts list）。
+
+    与 ``_find_last_message_content`` 的差异：保留 list 结构——媒体 parts
+    随消息进入下一轮上下文（跨轮视觉记忆 L3；更早轮次由发送前保留策略
+    降级为占位文本）。无媒体且文本为空的 user 消息仍视为无内容。
+    """
+    for index in range(len(messages or []) - 1, -1, -1):
+        message = messages[index]
+        if message.get("role") != "user":
+            continue
+        content = message.get("content", "")
+        if _content_to_text(content).strip():
+            return content, index
+    return "", -1
+
+
 def _find_last_message_content(messages: list[dict], role: str) -> Tuple[str, int]:
     for index in range(len(messages or []) - 1, -1, -1):
         message = messages[index]
@@ -302,6 +408,28 @@ def _find_last_assistant_content(messages: list[dict]) -> Tuple[str, int]:
         if content:
             return content, index
     return "", -1
+
+
+def _find_best_assistant_content(messages: list[dict]) -> Tuple[str, int]:
+    """Return the most substantive assistant content plus the last assistant index.
+
+    一轮内可能有多条 assistant 回复（长回复+工具调用，工具结果后又补短收尾）。
+    只取最后一条会让长回复被短收尾吞掉，因此取内容最长的一条
+    （等长时取靠后者）；index 返回最后一条 assistant 消息的位置，
+    供时间戳锚定使用。
+    """
+    best_content = ""
+    best_length = -1
+    last_assistant_index = -1
+    for index, message in enumerate(messages or []):
+        if message.get("role") != "assistant":
+            continue
+        last_assistant_index = index
+        content = _content_to_text(message.get("content", "")).strip()
+        if content and len(content) >= best_length:
+            best_length = len(content)
+            best_content = content
+    return best_content, last_assistant_index
 
 
 def _assistant_content_too_short(content: str) -> bool:
@@ -482,6 +610,10 @@ def _content_to_text(content: Any) -> str:
     if isinstance(content, dict):
         if "text" in content:
             return _content_to_text(content.get("text"))
+        described = media_payload.describe_media_part(content)
+        if described is not None:
+            # 媒体 part：输出展示占位符，绝不让 base64 进入任何文本化路径
+            return described
         return json.dumps(content, ensure_ascii=False, default=str)
     return str(content)
 

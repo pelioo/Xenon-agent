@@ -1,6 +1,8 @@
 """启动自检脚本 — 验证记忆系统完整性"""
 import sys
-sys.path.insert(0, r'D:\Xenon\agent_Xenon')
+from pathlib import Path
+# 动态推导项目根：xenon_core/memory_core/_startup_check.py → 向上三级 = 项目根
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from xenon_core.memory_core import MemoryAPI
 from xenon_core.memory_core.schema import STORAGE_ROOT, LEVEL_DIRS
@@ -39,9 +41,10 @@ print(f"  形状: {'→'.join(shape_parts)}")
 print("\n[4/4] 搜索功能...")
 tests = ["自主性", "递归", "记忆", "因果"]
 for q in tests:
-    results = api.search(q)
-    levels = set(r.get("level", 0) for r in results)
-    print(f"  搜索 '{q}': {len(results)} 条 (层级: {sorted(levels)})")
+    result = api.search(q)
+    items = result.get("results", []) if isinstance(result, dict) else result
+    levels = set(r.get("level", 0) for r in items)
+    print(f"  搜索 '{q}': {len(items)} 条 (层级: {sorted(levels)})")
 
 print("\n" + "=" * 50)
 if total > 0:

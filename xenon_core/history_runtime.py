@@ -5,6 +5,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from xenon_core import media_payload
+
 
 def persist_full_history_snapshot(
     *,
@@ -18,11 +20,15 @@ def persist_full_history_snapshot(
         active_history_dir = Path(history_dir)
         active_history_dir.mkdir(parents=True, exist_ok=True)
         current_time = now or datetime.now()
+        # 原生多模态（Phase 1）：落盘前媒体 part 引用化，base64 绝不落盘
+        persisted_messages = media_payload.messages_for_persistence(
+            full_conversation_history
+        )
         payload = {
             "session_id": history_session_id,
             "updated_at": current_time.isoformat(),
             "message_count": len(full_conversation_history),
-            "messages": full_conversation_history,
+            "messages": persisted_messages,
         }
         latest_path = active_history_dir / f"{history_session_id}_full_history.json"
         latest_path.write_text(
@@ -77,7 +83,8 @@ def save_api_request(
         payload = {
             "timestamp": current_time.isoformat(),
             "model": model,
-            "messages": messages,
+            # 日志红action：data URI 截断为 data:<mime>;base64,<N chars>（Phase 1）
+            "messages": media_payload.redact_media_for_log(messages),
             "tools": tools or [],
         }
         filepath.write_text(
@@ -119,7 +126,8 @@ def save_turn_debug_trace(
         payload = {
             "timestamp": current_time.isoformat(),
             "message_count": len(turn_messages),
-            "messages": turn_messages,
+            # 日志红action：data URI 截断为 data:<mime>;base64,<N chars>（Phase 1）
+            "messages": media_payload.redact_media_for_log(turn_messages),
             "metadata": metadata or {},
         }
         filepath.write_text(
@@ -173,7 +181,13 @@ def save_memory_log(
             "role": role,
         }
         if content:
-            log_data["content"] = content
+            # 原生多模态（Phase 1）：list content 先文本化（媒体 → 占位符），
+            # 防止 base64 进入 memory_log
+            log_data["content"] = (
+                media_payload.content_list_to_text(content)
+                if isinstance(content, list)
+                else content
+            )
         if reasoning_content:
             log_data["reasoning_content"] = reasoning_content
 

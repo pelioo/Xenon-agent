@@ -340,13 +340,13 @@ class DownloadToolManager:
             return {"success": True, "message": f"任务 {task_id} 已标记为取消"}
 
     def download_wait(
-        self, task_id: str, timeout: Optional[float] = None
+        self, task_id: str, timeout: Optional[float] = 300
     ) -> Dict[str, Any]:
         """阻塞等待下载任务完成。
 
         Args:
             task_id: 任务 ID
-            timeout: 等待超时秒数（None 表示不限）
+            timeout: 等待超时秒数，默认 300；传 None 表示不限（不推荐）
 
         Returns:
             任务完成后的完整结果

@@ -174,10 +174,13 @@ class CodeEditorManager:
     提供类似 Trae IDE 的原子化操作能力
     """
     
-    def __init__(self, workspace_dir: str = ".", enable_checksum: bool = True, max_history: int = 10, retention_days: int = 7):
+    def __init__(self, workspace_dir: str = ".", enable_checksum: bool = True,
+                 max_history: int = 10, retention_days: int = 7,
+                 navigator: Optional["CodeNavigator"] = None):
         self.workspace_dir = Path(workspace_dir).resolve()
         self.enable_checksum = enable_checksum
         self.history_manager = FileHistoryStore(max_history=max_history, retention_days=retention_days)
+        self._navigator = navigator  # 供 view 的 location 定位复用 AST 扫描缓存
         
         # ========== search 函数的安全限制（防止 token 暴涨） ==========
         self.SEARCH_MAX_FILE_SIZE = 200 * 1024          # 跳过超过 200KB 的文件
@@ -217,6 +220,7 @@ class CodeEditorManager:
         
         # find_files / list_dir 的限制
         self.FIND_MAX_RESULTS = 500
+        self.FIND_MAX_OUTPUT_BYTES = 10 * 1024   # find_files 输出硬上限 10KB（含截断提示）
         self.LIST_DIR_MAX_ITEMS = 500
         
     def _resolve_path(self, file_path: str) -> Path:
@@ -243,10 +247,14 @@ class CodeEditorManager:
         except Exception:
             return True  # 读不到当成二进制跳过
 
-    def view(self, file_path: str, view_range: Optional[List[int]] = None, 
-             limit: int = 500, offset: int = 0, show_invisible: bool = False) -> Dict:
+    def view(self, file_path: str, view_range: Optional[List[int]] = None,
+             limit: int = 500, offset: int = 0, show_invisible: bool = False,
+             location: Optional[str] = None, context_lines: int = 5) -> Dict:
         """
         查看文件内容（带行号），支持分页查看。
+
+        location 支持按符号定位：函数名 / 类名 / 行号 / 行范围（如 "12-34"）。
+        定位模式下自动显示目标区域上下文（context_lines 行），目标行用 → 标记。
         """
         path = self._resolve_path_or_error(file_path)
         if isinstance(path, dict):
@@ -260,10 +268,17 @@ class CodeEditorManager:
                 lines = content.splitlines(keepends=True)
             
             total_lines = len(lines)
-            start_line = 1
-            end_line = total_lines
-            
-            if view_range:
+            target_range = None  # (start_line, end_line) 定位目标区域
+
+            if location:
+                try:
+                    target_range = self._resolve_location(path, location)
+                except ValueError as e:
+                    return {"success": False, "error": f"定位失败: {e}"}
+                start_line, end_line = target_range
+                actual_start = max(1, start_line - context_lines)
+                actual_end = min(total_lines, end_line + context_lines)
+            elif view_range:
                 if len(view_range) != 2:
                     return {"success": False, "error": "view_range 必须包含两个整数 [start, end]"}
                 
@@ -272,24 +287,33 @@ class CodeEditorManager:
                 
                 if start_line > end_line:
                     return {"success": False, "error": f"无效的范围: {start_line} > {end_line}"}
+                actual_start, actual_end = start_line, end_line
             else:
-                start_line = max(1, offset + 1)
-                end_line = min(total_lines, start_line + limit - 1)
+                actual_start = max(1, offset + 1)
+                actual_end = min(total_lines, actual_start + limit - 1)
             
             indent_info = self._analyze_indentation(content)
             
             output_lines = []
-            for i in range(start_line - 1, min(end_line, total_lines)):
+            for i in range(actual_start - 1, min(actual_end, total_lines)):
                 line = lines[i].rstrip('\r\n')
                 if show_invisible:
                     line = self._show_invisible_chars(line)
-                output_lines.append(f"{i+1:>6}\t{line}")
+                if target_range and target_range[0] <= i + 1 <= target_range[1]:
+                    output_lines.append(f"→ {i+1:>6}\t{line}")
+                else:
+                    prefix = "  " if target_range else ""
+                    output_lines.append(f"{prefix}{i+1:>6}\t{line}")
             
             content_str = "\n".join(output_lines)
             
-            msg = f"文件: {file_path} [行 {start_line}-{min(end_line, total_lines)} / 共 {total_lines} 行]"
-            if total_lines > end_line:
-                msg += f" (还有 {total_lines - end_line} 行未显示，可使用 view_range 或 offset 查看)"
+            if target_range:
+                msg = (f"文件: {file_path} [定位 {location} → 行 {target_range[0]}-{target_range[1]}"
+                       f" | 显示 {actual_start}-{min(actual_end, total_lines)} / 共 {total_lines} 行]")
+            else:
+                msg = f"文件: {file_path} [行 {actual_start}-{min(actual_end, total_lines)} / 共 {total_lines} 行]"
+                if total_lines > actual_end:
+                    msg += f" (还有 {total_lines - actual_end} 行未显示，可使用 view_range 或 offset 查看)"
             msg += f"\n缩进类型: {indent_info['indent_type']} (共{indent_info['tab_lines']}行用Tab, {indent_info['space_lines']}行用空格)"
             
             return {
@@ -297,15 +321,22 @@ class CodeEditorManager:
                 "content": content_str,
                 "metadata": {
                     "total_lines": total_lines,
-                    "shown_range": [start_line, min(end_line, total_lines)],
+                    "shown_range": [actual_start, min(actual_end, total_lines)],
                     "file_path": str(path),
-                    "indent_info": indent_info
+                    "indent_info": indent_info,
+                    "target_range": list(target_range) if target_range else None
                 },
                 "message": msg
             }
             
         except Exception as e:
             return {"success": False, "error": str(e)}
+
+    def _resolve_location(self, path: Path, location: str) -> Tuple[int, int]:
+        """解析定位目标：行号 / 行范围 / 函数名 / 类名 → (start_line, end_line)"""
+        if self._navigator is None:
+            self._navigator = CodeNavigator()
+        return self._navigator.jump_to(str(path), location)
 
     def create(self, file_path: str, content: str) -> Dict:
         """创建新文件。如果文件已存在，则会报错，防止意外覆盖。"""
@@ -799,147 +830,250 @@ class CodeEditorManager:
 
     def find_files(self, pattern: str, dir_path: str = ".") -> Dict:
         """
-        查找匹配模式的文件（类似 glob）
-        强约束输出，自动排除噪声目录。
-        使用 walk() 遍历，在遍历时裁剪噪声目录，防止进入 venv 等大型目录。
+        查找匹配模式的文件（单层搜索，不递归）
+        只扫描 dir_path 当前层的文件和目录名，不进入子目录。
+        输出严格限制 10KB（含截断提示），超限自动截断。
+        需要深入子目录时，再次调用并指定子目录路径（或先用 list_dir 定位）。
         """
         search_dir = self._resolve_path_or_error(dir_path)
         if isinstance(search_dir, dict):
             return search_dir
-        
+
         if not search_dir.is_dir():
             return {"success": False, "error": f"不是目录: {dir_path}"}
-        
+
+        if not pattern or not pattern.strip():
+            return {"success": False, "error": "pattern 不能为空，请提供文件名模式（如 *.py、*terminal*）"}
+
         try:
             matches = []
             truncated = False
-            
-            # 使用 walk() 替代 glob/rglob，可在遍历时排除噪声目录
-            for root, dirs, files in search_dir.walk():
-                # 在遍历时直接裁剪噪声目录，避免进入
-                dirs[:] = [d for d in dirs if d not in self.SEARCH_EXCLUDE_DIRS]
-                
-                for file in files:
-                    if fnmatch.fnmatch(file, pattern):
-                        if len(matches) >= self.FIND_MAX_RESULTS:
-                            truncated = True
-                            break
-                        
-                        fp = root / file
-                        file_type = "DIR" if fp.is_dir() else "FILE"
-                        try:
-                            size = fp.stat().st_size if fp.is_file() else "-"
-                        except Exception:
-                            size = "-"
-                        matches.append({
-                            "path": str(fp),
-                            "type": file_type,
-                            "size": size
-                        })
-                
-                if truncated:
+
+            # 单层遍历：只扫当前目录，不递归进入子目录
+            for item in search_dir.iterdir():
+                if item.name in self.SEARCH_EXCLUDE_DIRS:
+                    continue
+                if not fnmatch.fnmatch(item.name, pattern):
+                    continue
+                if len(matches) >= self.FIND_MAX_RESULTS:
+                    truncated = True
                     break
-            
+                try:
+                    size = item.stat().st_size if item.is_file() else "-"
+                except Exception:
+                    size = "-"
+                matches.append({
+                    "path": str(item),
+                    "type": "DIR" if item.is_dir() else "FILE",
+                    "size": size
+                })
+
             matches.sort(key=lambda x: x["path"])
-            
-            output_lines = [f"[{m['type']:4}]\t{m['path']}\t{m['size']}" for m in matches]
-            content = "\n".join(output_lines) if output_lines else "未找到匹配文件"
-            
+
+            # 输出字节闸门：content（含截断提示）严格不超过 FIND_MAX_OUTPUT_BYTES
+            notice = ("\n⚠️ [结果截断: 输出超过 {limit}KB 上限，"
+                      "仅显示前 {n} 条；请缩小 pattern 或进入子目录再搜]")
+            reserve = 256  # 为截断提示预留字节，保证总输出严格 ≤ 10KB
+            budget = self.FIND_MAX_OUTPUT_BYTES - reserve
+
+            lines = []
+            total_bytes = 0
+            for m in matches:
+                line = f"[{m['type']:4}]\t{m['path']}\t{m['size']}"
+                line_bytes = len(line.encode("utf-8"))
+                if total_bytes + line_bytes > budget:
+                    truncated = True
+                    break
+                lines.append(line)
+                total_bytes += line_bytes
+
+            content = "\n".join(lines) if lines else "未找到匹配文件"
             if truncated:
-                content += f"\n\n⚠️ [结果截断: 超过 {self.FIND_MAX_RESULTS} 个，请缩小搜索范围或使用更精确的 pattern]"
-            
-            # ⚠️ 不再返回 files 原始字段
+                content += notice.format(
+                    limit=self.FIND_MAX_OUTPUT_BYTES // 1024,
+                    n=len(lines),
+                )
+
             return {
                 "success": True,
                 "content": content,
                 "metadata": {
                     "pattern": pattern,
                     "total_count": len(matches),
-                    "truncated": truncated
+                    "returned_count": len(lines),
+                    "truncated": truncated,
+                    "recursive": False
                 }
             }
-            
+
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    def list_dir(self, dir_path: str = ".", recursive: bool = False, max_depth: int = 3) -> Dict:
+    def list_dir(self, dir_path: str = ".") -> Dict:
         """
-        列出目录结构。带数量上限和噪声目录排除。
+        列出目录（单层视图）+ 子目录统计分析。
+        每个子目录显示: 子目录数/文件数/总大小/文件类型分布/预估token，
+        用于评估是否值得深入，避免盲目递归浪费上下文。
         """
         path = self._resolve_path_or_error(dir_path)
         if isinstance(path, dict):
             return path
         if not path.is_dir():
             return {"success": False, "error": f"不是目录: {dir_path}"}
-        
-        # 限制递归深度，防止无限展开
-        max_depth = max(1, min(max_depth, 5))
-        
+
         try:
-            items = []
-            truncated = {"flag": False}
-            
-            def list_recursive(p: Path, depth: int = 0, prefix: str = ""):
-                if depth > max_depth:
-                    return
-                if len(items) >= self.LIST_DIR_MAX_ITEMS:
-                    truncated["flag"] = True
-                    return
-                
-                try:
-                    sorted_items = sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
-                except PermissionError:
-                    return
-                
-                for i, item in enumerate(sorted_items):
-                    if len(items) >= self.LIST_DIR_MAX_ITEMS:
-                        truncated["flag"] = True
-                        return
-                    if item.name.startswith('.'):
-                        continue
-                    # 排除噪声目录
-                    if item.is_dir() and item.name in self.SEARCH_EXCLUDE_DIRS:
-                        items.append(f"{prefix}├── 📁 {item.name}/  [已折叠]")
-                        continue
-                    
-                    is_last = i == len(sorted_items) - 1
-                    connector = "└── " if is_last else "├── "
-                    item_type = "📁" if item.is_dir() else "📄"
-                    
-                    items.append(f"{prefix}{connector}{item_type} {item.name}")
-                    
-                    if item.is_dir() and recursive and depth < max_depth:
-                        new_prefix = prefix + ("    " if is_last else "│   ")
-                        list_recursive(item, depth + 1, new_prefix)
-            
-            if recursive:
-                items.append(f"📁 {path.name}/")
-                list_recursive(path, 0, "")
+            entries = sorted(path.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+        except PermissionError:
+            return {"success": False, "error": f"无权限读取目录: {dir_path}"}
+        except OSError as e:
+            return {"success": False, "error": f"读取目录失败: {e}"}
+
+        lines = []
+        dir_count = 0
+        file_count = 0
+        total_size = 0
+        total_text_bytes = 0
+        truncated = False
+
+        for i, item in enumerate(entries):
+            if len(lines) >= self.LIST_DIR_MAX_ITEMS:
+                truncated = True
+                break
+            if item.name.startswith('.'):
+                continue
+
+            is_last = i == len(entries) - 1
+            connector = "└── " if is_last else "├── "
+
+            if item.is_dir():
+                dir_count += 1
+                if item.name in self.SEARCH_EXCLUDE_DIRS:
+                    lines.append(f"{connector}📁 {item.name}/  [已折叠 - 噪声目录]")
+                    continue
+                s = self._summarize_dir(item)
+                total_size += s['size']
+                total_text_bytes += s['text_bytes']
+                if s['subdirs'] == 0 and s['files'] == 0:
+                    lines.append(f"{connector}📁 {item.name}/  [空目录]")
+                elif s['tokens'] == 0:
+                    lines.append(
+                        f"{connector}📁 {item.name}/  [{s['subdirs']}子目录 | {s['files']}文件 | "
+                        f"{self._fmt_size(s['size'])} | 无文本 | {s['type_summary']}]"
+                    )
+                else:
+                    lines.append(
+                        f"{connector}📁 {item.name}/  [{s['subdirs']}子目录 | {s['files']}文件 | "
+                        f"{self._fmt_size(s['size'])} | 展开约 {self._fmt_tokens(s['tokens'])} | {s['type_summary']}]"
+                    )
             else:
-                for item in sorted(path.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
-                    if len(items) >= self.LIST_DIR_MAX_ITEMS:
-                        truncated["flag"] = True
-                        break
-                    if item.name.startswith('.'):
-                        continue
-                    item_type = "📁" if item.is_dir() else "📄"
-                    try:
-                        size = f"({item.stat().st_size} bytes)" if item.is_file() else ""
-                    except Exception:
-                        size = ""
-                    items.append(f"{item_type} {item.name} {size}")
-            
-            content = "\n".join(items)
-            if truncated["flag"]:
-                content += f"\n\n⚠️ [结果截断: 超过 {self.LIST_DIR_MAX_ITEMS} 项，请缩小范围或减少 max_depth]"
-            
-            return {
-                "success": True,
-                "content": content,
-                "message": f"目录: {dir_path}" + (" (递归)" if recursive else "")
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+                file_count += 1
+                try:
+                    size = item.stat().st_size
+                except OSError:
+                    size = 0
+                total_size += size
+                if self._is_text_name(item.name):
+                    total_text_bytes += size
+                    lines.append(
+                        f"{connector}📄 {item.name}  ({self._fmt_size(size)} | 约 {self._fmt_tokens(self._est_tokens(size))})"
+                    )
+                else:
+                    lines.append(f"{connector}📄 {item.name}  ({self._fmt_size(size)})")
+
+        content = "\n".join(lines)
+        content += (
+            f"\n\n📊 本层: {dir_count} 目录 | {file_count} 文件 | 总大小 {self._fmt_size(total_size)}"
+            f" | 全部展开约 {self._fmt_tokens(self._est_tokens(total_text_bytes))}"
+        )
+        if truncated:
+            content += f"\n⚠️ [结果截断: 超过 {self.LIST_DIR_MAX_ITEMS} 项]"
+        content += "\n💡 提示: 单目录超过 50KB 时，建议用 search / find_files 定位目标文件，避免逐层展开消耗大量 token"
+
+        return {
+            "success": True,
+            "content": content,
+            "message": f"目录: {dir_path}（单层视图 + 子目录统计）"
+        }
+
+    # ---------- list_dir 辅助: 子目录统计与 token 预估 ----------
+
+    # 文本/代码文件扩展名白名单（用于 token 估算，避免把二进制当文本）
+    TEXT_FILE_EXTS = {
+        'py', 'js', 'ts', 'jsx', 'tsx', 'java', 'c', 'cpp', 'h', 'hpp', 'cs',
+        'go', 'rs', 'rb', 'php', 'swift', 'kt', 'scala', 'lua', 'pl', 'r',
+        'md', 'markdown', 'txt', 'rst', 'json', 'yaml', 'yml', 'xml', 'html',
+        'htm', 'css', 'scss', 'less', 'vue', 'svelte', 'sql', 'sh', 'bat',
+        'cmd', 'ps1', 'ini', 'toml', 'cfg', 'conf', 'log', 'csv', 'tsv',
+        'proto', 'gradle', 'properties', 'env', 'gitignore', 'dockerfile',
+        'makefile', 'cmake', 'tex', 'svg', 'editorconfig', 'gitattributes',
+        'gitmodules', 'gitkeep', 'ipynb', 'lock',
+    }
+
+    def _is_text_name(self, name: str) -> bool:
+        """按扩展名/文件名判断是否为文本文件（用于 token 估算）"""
+        low = name.lower()
+        if low in self.TEXT_FILE_EXTS:
+            return True
+        ext = low.rsplit('.', 1)[-1] if '.' in low else ''
+        return ext in self.TEXT_FILE_EXTS
+
+    def _est_tokens(self, text_bytes: int) -> int:
+        """估算 token 数：代码/文本平均约 3.5 字节/token"""
+        return int(text_bytes / 3.5)
+
+    def _fmt_tokens(self, tokens: int) -> str:
+        """格式化 token 数: 1234 -> 1.2K tokens"""
+        if tokens >= 1_000_000:
+            return f"{tokens / 1_000_000:.1f}M tokens"
+        if tokens >= 1_000:
+            return f"{tokens / 1_000:.1f}K tokens"
+        return f"{tokens} tokens"
+
+    def _fmt_size(self, n: int) -> str:
+        """人性化文件大小: B/KB/MB/GB"""
+        if n >= 1 << 30:
+            return f"{n / (1 << 30):.1f}GB"
+        if n >= 1 << 20:
+            return f"{n / (1 << 20):.1f}MB"
+        if n >= 1 << 10:
+            return f"{n / (1 << 10):.1f}KB"
+        return f"{n}B"
+
+    def _summarize_dir(self, p: Path) -> Dict:
+        """单层统计子目录: 子目录数/文件数/总大小/文本字节/类型分布 top4"""
+        subdirs = 0
+        files = 0
+        size = 0
+        text_bytes = 0
+        ext_counter = Counter()
+        try:
+            for child in p.iterdir():
+                try:
+                    if child.is_dir():
+                        subdirs += 1
+                    else:
+                        files += 1
+                        sz = child.stat().st_size
+                        size += sz
+                        low = child.name.lower()
+                        ext = low.rsplit('.', 1)[-1] if '.' in low else 'noext'
+                        ext_counter[ext] += 1
+                        if self._is_text_name(child.name):
+                            text_bytes += sz
+                except OSError:
+                    continue
+        except (PermissionError, OSError):
+            pass
+        top = ext_counter.most_common(4)
+        type_summary = " ".join(f".{e}:{n}" for e, n in top) if top else "无文件"
+        return {
+            "subdirs": subdirs,
+            "files": files,
+            "size": size,
+            "text_bytes": text_bytes,
+            "tokens": self._est_tokens(text_bytes),
+            "type_summary": type_summary,
+        }
 
     def get_file_info(self, file_path: str) -> Dict:
         """获取文件详细信息"""
@@ -1066,139 +1200,6 @@ class CodeEditorManager:
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
-
-    def get_tree_view(self, dir_path: str = "", max_depth: int = 2,
-                      max_items: int = 100, show_size: bool = True,
-                      show_emojis: bool = True) -> Dict:
-        """生成可视化目录树（树形字符画格式）。"""
-        path = self._resolve_path_or_error(dir_path) if dir_path else self.workspace_dir
-        if isinstance(path, dict):
-            return path
-        if not path.is_dir():
-            return {"success": False, "error": f"不是目录: {dir_path}"}
-
-        max_depth = max(1, min(max_depth, 5))
-        lines = []
-        total_items, dir_count, file_count, truncated = 0, 0, 0, False
-
-        def _fmt_size(sz):
-            if sz < 1024: return f"{sz}B"
-            if sz < 1024 * 1024: return f"{sz/1024:.1f}KB"
-            if sz < 1024 * 1024 * 1024: return f"{sz/(1024*1024):.1f}MB"
-            return f"{sz/(1024*1024*1024):.1f}GB"
-
-        def _build_tree(cur_dir, prefix, depth):
-            nonlocal total_items, dir_count, file_count, truncated
-            if depth > max_depth or total_items >= max_items:
-                truncated = True
-                return
-            try:
-                items = sorted(
-                    os.scandir(cur_dir),
-                    key=lambda x: (0 if x.is_dir() else 1, x.name.lower())
-                )
-            except (PermissionError, OSError):
-                lines.append(f"{prefix}└── [权限不足]")
-                return
-            for i, item in enumerate(items):
-                if total_items >= max_items:
-                    truncated = True
-                    lines.append(f"{prefix}└── ... (还有更多)")
-                    return
-                total_items += 1
-                is_last = (i == len(items) - 1)
-                conn = "└── " if is_last else "├── "
-                new_prefix = prefix + ("    " if is_last else "│   ")
-                try:
-                    if item.is_dir():
-                        dir_count += 1
-                        icon = "📂 " if show_emojis else ""
-                        lines.append(f"{prefix}{conn}{icon}{item.name}/")
-                        if depth < max_depth:
-                            _build_tree(Path(item.path), new_prefix, depth + 1)
-                    else:
-                        file_count += 1
-                        icon2 = "📄 " if show_emojis else ""
-                        sz_str = ""
-                        if show_size:
-                            try:
-                                sz_str = f" ({_fmt_size(item.stat().st_size)})"
-                            except OSError:
-                                pass
-                        lines.append(f"{prefix}{conn}{icon2}{item.name}{sz_str}")
-                except OSError:
-                    continue
-
-        root_icon = "📂 " if show_emojis else ""
-        lines.append(f"{root_icon}{path.name}/")
-        _build_tree(path, "", 1)
-
-        tree_text = "\n".join(lines)
-
-        return {
-            "success": True,
-            "path": str(path),
-            "tree": tree_text,
-            "summary": {"directories": dir_count, "files": file_count, "total_items": total_items},
-            "meta": {
-                "max_depth": max_depth,
-                "truncated": truncated,
-            },
-            "message": f"生成目录树成功：{dir_count} 个目录, {file_count} 个文件",
-        }
-
-    def quick_scan(self, dir_path: str = "", max_depth: int = 3) -> Dict:
-        """快速扫描目录结构（轻量级，适合了解目录布局）。"""
-        path = self._resolve_path_or_error(dir_path) if dir_path else self.workspace_dir
-        if isinstance(path, dict):
-            return path
-        if not path.is_dir():
-            return {"success": False, "error": f"不是目录: {dir_path}"}
-
-        max_depth = max(1, min(max_depth, 10))
-        dirs_list = []
-        file_types = {}
-        total_files, total_dirs = 0, 0
-
-        try:
-            for root, dirs, files in path.walk():
-                rel = root.relative_to(path)
-                depth_here = len(rel.parts) if path != root else 0
-                if depth_here > max_depth:
-                    dirs[:] = []
-                    continue
-                dirs[:] = [d for d in dirs if d not in self.SEARCH_EXCLUDE_DIRS]
-
-                for d in dirs:
-                    dir_path_obj = root / d
-                    rel_path = dir_path_obj.relative_to(path)
-                    dirs_list.append({"path": str(rel_path), "name": d, "depth": len(rel_path.parts)})
-                    total_dirs += 1
-
-                for f in files:
-                    total_files += 1
-                    ext = Path(f).suffix.lower() or "(no ext)"
-                    file_types[ext] = file_types.get(ext, 0) + 1
-
-            by_depth = {}
-            for d in dirs_list:
-                lvl = d["depth"]
-                by_depth.setdefault(lvl, []).append(d["name"])
-
-            return {
-                "success": True,
-                "path": str(path),
-                "summary": {
-                    "total_directories": total_dirs,
-                    "total_files": total_files,
-                    "file_types": dict(sorted(file_types.items(), key=lambda x: -x[1])[:10]),
-                },
-                "directory_tree": by_depth,
-                "all_directories": [d["path"] for d in dirs_list],
-                "message": f"扫描完成: {total_dirs} 个目录, {total_files} 个文件",
-            }
-        except Exception as e:
-            return {"success": False, "error": f"扫描失败: {str(e)}"}
 
     def read_file_chunked(self, file_path: str, chunk_index: int = 0,
                           chunk_size: int = None, encoding: str = 'utf-8') -> Dict:
@@ -1491,7 +1492,7 @@ def get_tool_definitions():
             "type": "function",
             "function": {
                 "name": "code_editor_view",
-                "description": "【修改前必做】查看代码文件内容（带行号）。修改代码前必须先查看目标区域。\n\n建议：\n- 默认只显示 500 行，使用 view_range 精确指定范围（如 [10, 60]）\n- 大文件请配合 offset 分页查看\n- 注意文件缩进类型（Tab/空格），替换时会自动适配\n\n返回内容包括：代码行、缩进类型、总行数等。",
+                "description": "【修改前必做】查看代码文件内容（带行号）。修改代码前必须先查看目标区域。\n\n建议：\n- 默认只显示 500 行，使用 view_range 精确指定范围（如 [10, 60]）\n- 大文件请配合 offset 分页查看\n- 按函数名/类名/行号/范围定位：用 location 参数（如 \"agent_runtime\"、\"123\"、\"12-34\"），自动带上下文并标记目标行\n- 注意文件缩进类型（Tab/空格），替换时会自动适配\n\n返回内容包括：代码行、缩进类型、总行数等。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1499,7 +1500,9 @@ def get_tool_definitions():
                         "view_range": {"type": "array", "items": {"type": "integer"}, "description": "查看的行号范围 [start, end]，例如 [10, 30]"},
                         "limit": {"type": "integer", "description": "最大返回行数，默认 500"},
                         "offset": {"type": "integer", "description": "跳过的行数，用于分页"},
-                        "show_invisible": {"type": "boolean", "description": "显示不可见字符（Tab→, 空格·），用于调试缩进问题"}
+                        "show_invisible": {"type": "boolean", "description": "显示不可见字符（Tab→, 空格·），用于调试缩进问题"},
+                        "location": {"type": "string", "description": "定位目标：函数名/类名/行号/行范围（如 \"12-34\"），定位时自动显示上下文并标记目标行"},
+                        "context_lines": {"type": "integer", "description": "定位时目标区域上下各显示多少行，默认 5"}
                     },
                     "required": ["file_path"]
                 }
@@ -1637,11 +1640,11 @@ def get_tool_definitions():
             "type": "function",
             "function": {
                 "name": "code_editor_find_files",
-                "description": "查找匹配模式的文件（类似 glob）。最多返回 500 个结果，自动排除噪声目录。",
+                "description": "查找匹配模式的文件（单层搜索，不递归）。只搜索 dir_path 当前层的文件和目录名，输出上限 10KB 自动截断；深入子目录请再次调用并指定子目录路径（或先用 list_dir 定位）。",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "pattern": {"type": "string", "description": "文件名模式，如 *.py, **/*.js"},
+                        "pattern": {"type": "string", "description": "文件名模式（单层匹配），如 *.py, *test*"},
                         "dir_path": {"type": "string", "description": "搜索起始目录，默认当前目录"}
                     },
                     "required": ["pattern"]
@@ -1652,13 +1655,11 @@ def get_tool_definitions():
             "type": "function",
             "function": {
                 "name": "code_editor_list_dir",
-                "description": "列出目录结构。支持递归显示。最多显示 500 项，自动折叠 node_modules 等噪声目录。",
+                "description": "列出目录（单层视图），并对每个子目录做统计分析：子目录数/文件数/总大小/文件类型分布/预估展开token。用于评估是否值得深入，避免盲目递归消耗上下文。",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "dir_path": {"type": "string", "description": "目录路径，默认当前目录"},
-                        "recursive": {"type": "boolean", "description": "是否递归列出子目录"},
-                        "max_depth": {"type": "integer", "description": "递归最大深度（1-5），默认 3"}
+                        "dir_path": {"type": "string", "description": "目录路径，默认当前目录"}
                     },
                     "required": []
                 }
@@ -1721,39 +1722,6 @@ def get_tool_definitions():
                         "dir_path": {"type": "string", "description": "要创建的目录路径"}
                     },
                     "required": ["dir_path"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "code_editor_get_tree_view",
-                "description": "生成可视化目录树（树形字符画格式）。快速了解目录结构布局。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "dir_path": {"type": "string", "description": "目标目录路径，默认为当前目录"},
-                        "max_depth": {"type": "integer", "description": "最大递归深度（1-5），默认 2"},
-                        "max_items": {"type": "integer", "description": "最大显示项目数，默认 100"},
-                        "show_size": {"type": "boolean", "description": "是否显示文件大小，默认 true"},
-                        "show_emojis": {"type": "boolean", "description": "是否使用 emoji 图标，默认 true"}
-                    },
-                    "required": []
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "code_editor_quick_scan",
-                "description": "快速扫描目录结构（轻量级）。返回文件类型统计、目录分层等摘要信息，适合快速了解项目布局。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "dir_path": {"type": "string", "description": "目标目录，默认为当前目录"},
-                        "max_depth": {"type": "integer", "description": "最大扫描深度，默认 3"}
-                    },
-                    "required": []
                 }
             }
         },
@@ -2186,20 +2154,6 @@ class CodeNavigator:
             return cls.start_line, cls.end_line
         raise ValueError(f"未找到位置: {location}")
 
-    def view(self, file_path: str, start_line: int, end_line: int, context_lines: int = 5) -> str:
-        if file_path not in self.file_contents:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                self.file_contents[file_path] = f.read().split('\n')
-        lines = self.file_contents[file_path]
-        actual_start = max(1, start_line - context_lines)
-        actual_end = min(len(lines), end_line + context_lines)
-        result = [f"📄 {Path(file_path).name}:{start_line}-{end_line}", ""]
-        for i in range(actual_start - 1, actual_end):
-            line_num = i + 1
-            prefix = "→" if start_line <= line_num <= end_line else " "
-            result.append(f"{prefix} {line_num:4d} | {lines[i]}")
-        return '\n'.join(result)
-
     # ------------------------------------------------------------------------
     # 核心功能3：代码分析
     # ------------------------------------------------------------------------
@@ -2317,130 +2271,6 @@ class CodeNavigator:
                     except Exception as e:
                         print(f"⚠️  扫描失败 {file_path}: {e}")
         return project_cards
-
-    def generate_project_map(self, project_path: str, max_depth: int = 4) -> str:
-        project_path = os.path.abspath(project_path)
-        project_name = os.path.basename(project_path) or project_path
-        tree_map: Dict[str, dict] = {}
-        file_sizes: Dict[str, int] = {}
-        stats = {'total_dirs': 0, 'total_files': 0, 'py_files': 0, 'py_lines': 0, 'py_classes': 0, 'py_funcs': 0, 'skipped': 0, 'errors': 0}
-
-        for root, dirs, files in os.walk(project_path):
-            rel_root = os.path.relpath(root, project_path)
-            if rel_root == '.':
-                rel_root = ''
-            depth = 0 if not rel_root else rel_root.count(os.sep) + 1
-            if depth > max_depth:
-                dirs[:] = []
-                continue
-            stats['total_dirs'] += 1
-            kept_dirs = [d for d in dirs if not self._is_noise_dir(d)]
-            stats['skipped'] += len(dirs) - len(kept_dirs)
-            dirs[:] = kept_dirs
-            kept_files = []
-            for f in sorted(files):
-                if f.startswith('._') or f == '.DS_Store':
-                    stats['skipped'] += 1
-                    continue
-                if f.endswith(('.pyc', '.pyo', '.pyd')):
-                    stats['skipped'] += 1
-                    continue
-                kept_files.append(f)
-                stats['total_files'] += 1
-                full_path = os.path.join(root, f)
-                try:
-                    file_sizes[full_path] = os.path.getsize(full_path)
-                except OSError:
-                    file_sizes[full_path] = 0
-                if f.endswith('.py'):
-                    try:
-                        fsize = file_sizes.get(full_path, 0)
-                        if fsize < 500_000:
-                            with open(full_path, 'r', encoding='utf-8', errors='replace') as fh:
-                                content = fh.read()
-                            stats['py_files'] += 1
-                            stats['py_lines'] += content.count('\n') + (0 if content.endswith('\n') else 1)
-                            stats['py_classes'] += len(re.findall(r'^\s*class\s+(\w+)', content, re.MULTILINE))
-                            stats['py_funcs'] += len(re.findall(r'^\s*(?:async\s+)?def\s+(\w+)', content, re.MULTILINE))
-                    except Exception:
-                        stats['errors'] += 1
-            tree_map[rel_root] = {'dirs': sorted(kept_dirs), 'files': kept_files}
-
-        lines = []
-        lines.append(f"📁 {project_name}/  ({stats['total_files']} files, {stats['total_dirs']} dirs)")
-        if stats['skipped']:
-            lines.append(f"   ⊘ 已跳过 {stats['skipped']} 个噪声目录/文件")
-        lines.append("")
-
-        ICON_MAP = {
-            '.py': '🐍', '.md': '📝', '.txt': '📝', '.rst': '📝',
-            '.json': '⚙️', '.yaml': '⚙️', '.yml': '⚙️', '.toml': '⚙️',
-            '.ini': '⚙️', '.cfg': '⚙️', '.html': '🌐', '.htm': '🌐',
-            '.css': '🎨', '.scss': '🎨', '.less': '🎨',
-            '.js': '📜', '.ts': '📜', '.jsx': '📜', '.tsx': '📜',
-            '.png': '🖼️', '.jpg': '🖼️', '.jpeg': '🖼️', '.gif': '🖼️', '.svg': '🖼️',
-            '.mp3': '🎵', '.wav': '🎵', '.ogg': '🎵',
-            '.mp4': '🎬', '.avi': '🎬', '.mov': '🎬',
-            '.zip': '📦', '.tar': '📦', '.gz': '📦', '.7z': '📦',
-            '.log': '📋', '.sh': '⚡', '.bat': '⚡', '.ps1': '⚡',
-            '.pdf': '📕', '.doc': '📘', '.docx': '📘',
-        }
-
-        def _icon(ext: str) -> str:
-            return ICON_MAP.get(ext, '📄')
-
-        def _render(rel_dir: str, prefix: str):
-            node = tree_map.get(rel_dir)
-            if not node:
-                return
-            items = node['dirs'] + node['files']
-            for i, item in enumerate(items):
-                is_last = (i == len(items) - 1)
-                connector = '└── ' if is_last else '├── '
-                child_prefix_line = '    ' if is_last else '│   '
-                new_prefix = prefix + child_prefix_line
-                child_rel = os.path.join(rel_dir, item) if rel_dir else item
-                if item in node['dirs']:
-                    sub_node = tree_map.get(child_rel, {})
-                    sub_file_count = len(sub_node.get('files', []))
-                    lines.append(f"{prefix}{connector}📁 {item}/  ({sub_file_count} files)")
-                    child_has_kids = any(k.startswith(child_rel + os.sep) for k in tree_map)
-                    current_depth = child_rel.count(os.sep) + 1
-                    if current_depth < max_depth and child_has_kids:
-                        _render(child_rel, new_prefix)
-                    elif child_has_kids:
-                        lines.append(f"{new_prefix}└── ... (max depth)")
-                else:
-                    ext = os.path.splitext(item)[1].lower()
-                    full_path = os.path.join(project_path, child_rel)
-                    fsize = file_sizes.get(full_path, 0) / 1024
-                    line = f"{prefix}{connector}{_icon(ext)} {item}  ({fsize:.1f} KB)"
-                    if ext == '.py' and file_sizes.get(full_path, 0) < 500_000:
-                        try:
-                            with open(full_path, 'r', encoding='utf-8', errors='replace') as fh:
-                                content = fh.read()
-                            classes = re.findall(r'^\s*class\s+(\w+)', content, re.MULTILINE)
-                            funcs = re.findall(r'^\s*(?:async\s+)?def\s+(\w+)', content, re.MULTILINE)
-                            parts = []
-                            if classes:
-                                parts.append(f"{len(classes)} classes")
-                            if funcs:
-                                parts.append(f"{len(funcs)} funcs")
-                            if parts:
-                                line += f"  [{', '.join(parts)}]"
-                        except Exception:
-                            pass
-                    lines.append(line)
-
-        _render('', '')
-
-        lines.append("")
-        if stats['py_files']:
-            lines.append(f"📊 Python: {stats['py_files']} files, {stats['py_lines']} lines, {stats['py_classes']} classes, {stats['py_funcs']} functions")
-        if stats['errors']:
-            lines.append(f"⚠️  {stats['errors']} files skipped due to read errors")
-
-        return '\n'.join(lines)
 
 
 class CodeFlowAnalyzer:
@@ -3178,14 +3008,6 @@ class CodeNavigatorToolManager:
             lines.append(f"\n... 还有 {len(results)-20} 个结果")
         return '\n'.join(lines)
 
-    def view_code(self, file_path: str, location: str, context_lines: int = 5) -> str:
-        """工具：查看代码"""
-        try:
-            start, end = self.navigator.jump_to(file_path, location)
-            return self.navigator.view(file_path, start, end, context_lines)
-        except ValueError as e:
-            return str(e)
-
     def analyze_function(self, file_path: str, function_name: str) -> str:
         """工具：分析函数"""
         card = self.navigator.scan(file_path)
@@ -3217,9 +3039,6 @@ class CodeNavigatorToolManager:
 
     def data_flow(self, file_path: str, func_name: str) -> str:
         return self.flow.data_flow(file_path, func_name)
-
-    def project_map(self, project_path: str) -> str:
-        return self.navigator.generate_project_map(project_path)
 
     def ast_search(self, query_type: str, target: str = "",
                    threshold: int = 0, file_path: str = None,
@@ -3259,8 +3078,8 @@ class CodeNavigatorToolManager:
 
 # 基于文件位置自动计算项目根目录，不依赖当前工作目录
 _default_workspace = str(Path(__file__).resolve().parent.parent.parent)
-_manager = CodeEditorManager(workspace_dir=_default_workspace)
 _navigator = CodeNavigatorToolManager()
+_manager = CodeEditorManager(workspace_dir=_default_workspace, navigator=_navigator.navigator)
 
 
 def handle_tool_call(function_name, arguments):
@@ -3274,12 +3093,6 @@ def handle_tool_call(function_name, arguments):
                 arguments['pattern'],
                 arguments.get('file_path'),
                 arguments.get('search_type', 'name')
-            )}
-        elif function_name == "code_editor_handler_CodeNavigator_view_code":
-            return {"success": True, "content": _navigator.view_code(
-                arguments['file_path'],
-                arguments['location'],
-                arguments.get('context_lines', 5)
             )}
         elif function_name == "code_editor_handler_CodeNavigator_analyze_function":
             return {"success": True, "content": _navigator.analyze_function(
@@ -3308,8 +3121,6 @@ def handle_tool_call(function_name, arguments):
                 arguments['project_path'],
                 arguments.get('max_files', 20)
             )}
-        elif function_name == "code_editor_handler_CodeNavigator_project_map":
-            return {"success": True, "content": _navigator.project_map(arguments['project_path'])}
         elif function_name == "code_editor_handler_CodeNavigator_ast_search":
             return {"success": True, "content": _navigator.ast_search(
                 arguments['query_type'],
@@ -3371,9 +3182,7 @@ def handle_tool_call(function_name, arguments):
             )
         elif function_name == "code_editor_list_dir":
             return _manager.list_dir(
-                arguments.get('dir_path', '.'),
-                arguments.get('recursive', False),
-                arguments.get('max_depth', 3)
+                arguments.get('dir_path', '.')
             )
         elif function_name == "code_editor_get_file_info":
             return _manager.get_file_info(arguments['file_path'])
@@ -3391,19 +3200,6 @@ def handle_tool_call(function_name, arguments):
             )
         elif function_name == "code_editor_create_directory":
             return _manager.create_directory(arguments['dir_path'])
-        elif function_name == "code_editor_get_tree_view":
-            return _manager.get_tree_view(
-                arguments.get('dir_path', ''),
-                arguments.get('max_depth', 2),
-                arguments.get('max_items', 100),
-                arguments.get('show_size', True),
-                arguments.get('show_emojis', True)
-            )
-        elif function_name == "code_editor_quick_scan":
-            return _manager.quick_scan(
-                arguments.get('dir_path', ''),
-                arguments.get('max_depth', 3)
-            )
         elif function_name == "code_editor_read_file_chunked":
             return _manager.read_file_chunked(
                 arguments['file_path'],
@@ -3476,10 +3272,9 @@ if __name__ == "__main__":
     
     print("\n6. 列出目录")
     res = handle_tool_call("code_editor_list_dir", {
-        "dir_path": ".",
-        "recursive": False
+        "dir_path": "."
     })
-    print(res.get('content', '')[:500])
+    print(res.get('content', '')[:800])
     
     print("\n7. 获取文件信息")
     res = handle_tool_call("code_editor_get_file_info", {

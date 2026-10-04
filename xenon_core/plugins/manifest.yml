@@ -1,0 +1,58 @@
+# Xenon 内置插件清单（基础层）
+#
+# 每行：{id, name, enabled, optional, config, dependencies}
+# 项目清单 xenon.profile.yml 与机器层 ~/.xenon/patch.yml 按 id 覆盖本层：
+#   同 id 整行替换 config（不深合并）；disabled: true 移除该行。
+#
+# P1 约定：默认装配 = 现状行为。插件激活只注册服务/幂等启动，
+# 现有 AIAgent 调用路径保持不变；消费方切换在 P2/P3 进行。
+
+- id: settings
+  name: xenon_core.plugins.settings
+  # P2：分层配置服务（xenon.yml + 机器层 + watchdog 热重载）。
+  # 置于清单首位：其他插件/消费者可经 ctx.get("settings") 读取热配置。
+
+- id: prompts
+  name: xenon_core.plugins.prompts
+  # P3：prompts/ 目录内容注册为系统提示词片段（保持旧组装结果一致）；
+  # 其他插件可经 ctx.add_prompt() 追加片段。
+
+- id: tools
+  name: xenon_core.plugins.tools
+  # P4：ToolManager 由加载器装配（读取 Tools/*/plugin.yml 元数据），
+  # 注册 tools 与 tools.meta 服务；bootstrap 装配后回填 agent.tool_manager。
+  # 须在 semantic-router 之前（其 inject 依赖 tools 服务）。
+
+- id: heartbeat
+  name: xenon_core.plugins.heartbeat
+  enabled: false
+  # P1 默认禁用：CLI（Xenon.py __main__）与 webui（main.py lifespan）已自行管理
+  # 心跳生命周期；P3 入口 profile 化后改回默认启用，由本插件统一负责。
+  config:
+    mode: plugin
+
+- id: semantic-router
+  name: xenon_core.plugins.semantic_router
+  config:
+    # 默认值与 Xenon.py 模块级常量一致（P2 迁入 xenon.yml 后由配置层覆盖）
+    model: deepseek-v4-flash
+    timeout: 20
+    max_tokens: 450
+    thinking_enabled: false
+    reasoning_effort: high
+
+- id: autonomy
+  name: xenon_core.plugins.autonomy
+  config:
+    default_max_steps: 1
+
+- id: multi-agent
+  name: xenon_core.plugins.multi_agent
+  config:
+    default_subtasks: 2
+    queue_path: Tasks/multi_agent_queue.json
+
+- id: agent-loop
+  name: xenon_core.plugins.agent_loop
+  # P5：AIAgent 运行期服务（对话流/上下文/工具处理/自主执行），
+  # bootstrap 装配后回填 agent.agent_runtime；未装配时 bootstrap 直接构造（回退）。

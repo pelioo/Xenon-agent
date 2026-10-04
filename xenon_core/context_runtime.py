@@ -21,6 +21,57 @@ _DEFAULT_DS_TOKENIZER_PATH = (
 )
 
 
+# ── 多模态 content parts 的 token 估算（原生多模态改造 Phase 1）────────
+# 图片：与 media_codec 共享 85 + 170×tiles 公式（宁可高估，不漏算）；
+# 音频/视频：按体积的保守启发式（Phase 3 API 实测后校准）。
+_AV_TOKEN_PER_KB = {"audio": 8, "video": 16}
+_MEDIA_TOKEN_FALLBACK = {
+    "image": 85 + 170 * 4,
+    "audio": 256,
+    "video": 1024,
+}
+
+
+def _extract_media_part(part: Any) -> Tuple[Optional[str], str]:
+    """从 content part 提取 (kind, uri)；非媒体 part 返回 (None, "")。"""
+    if not isinstance(part, dict):
+        return None, ""
+    part_type = str(part.get("type") or "").strip()
+    if part_type == "image_url":
+        value = part.get("image_url")
+        url = value.get("url") if isinstance(value, dict) else value
+        return "image", str(url or "")
+    if part_type == "input_audio":
+        value = part.get("input_audio")
+        data = value.get("data") if isinstance(value, dict) else value
+        return "audio", str(data or "")
+    if part_type in ("video_url", "input_video"):
+        value = part.get("video_url") or part.get("input_video")
+        url = (value.get("url") or value.get("data")) if isinstance(value, dict) else value
+        return "video", str(url or "")
+    return None, ""
+
+
+def _estimate_media_part_tokens(kind: str, uri: str) -> int:
+    """媒体 part 的 token 估算（与主管线共享 media_codec 公式，失败时保守回退）。"""
+    media_codec = None
+    try:
+        from xenon_core import media_codec as _mc
+
+        media_codec = _mc
+    except Exception:  # pragma: no cover - 媒体模块不可用时保持保守估算
+        media_codec = None
+    if kind == "image":
+        if uri.startswith("data:") and media_codec is not None:
+            return media_codec.estimate_image_tokens_from_data_uri(uri)
+        if media_codec is not None:
+            return media_codec.REMOTE_IMAGE_TOKEN_FALLBACK
+        return _MEDIA_TOKEN_FALLBACK["image"]
+    # 音频/视频：体积启发式（base64 → 原始字节 → 保守 token 估数）
+    raw_kb = max(1, len(uri) * 3 // 4 // 1024)
+    return raw_kb * _AV_TOKEN_PER_KB.get(kind, 8)
+
+
 class TokenCounter:
     """Token计数器类，用于估计和管理上下文token使用量。
 
@@ -81,11 +132,46 @@ class TokenCounter:
         """计算文本的 token 数。优先使用 DeepSeek tokenizer。"""
         if not text:
             return 0
+        if not isinstance(text, str):
+            # 多模态 content parts（list）→ 走多模态计量（原生多模态 Phase 1）
+            return self.count_content_tokens(text)
         if self._ds_tokenizer is not None:
             return len(self._ds_tokenizer.encode(text).ids)
         if self.encoder is not None:
             return len(self.encoder.encode(text, disallowed_special=()))
         return 0
+
+    def count_content_tokens(self, content: Any) -> int:
+        """计算消息 content 的 token 数（兼容 str 与多模态 content parts）。
+
+        - str：与存量行为完全一致（走原 tokenizer 路径）；
+        - list：文本 part 走原文本计量；媒体 part 按 media_codec 共享公式
+          估算（图片 85 + 170×tiles），其余 part 序列化计量。
+        """
+        if not content:
+            return 0
+        if isinstance(content, str):
+            return self.count_tokens(content)
+        if not isinstance(content, list):
+            return self.count_tokens(str(content))
+
+        total = 0
+        for item in content:
+            if isinstance(item, str):
+                total += self.count_tokens(item)
+            elif isinstance(item, dict):
+                kind, uri = _extract_media_part(item)
+                if kind is not None:
+                    total += _estimate_media_part_tokens(kind, uri)
+                elif "text" in item:
+                    total += self.count_tokens(str(item.get("text") or ""))
+                else:
+                    total += self.count_tokens(
+                        json.dumps(item, ensure_ascii=False, default=str)
+                    )
+            else:
+                total += self.count_tokens(str(item))
+        return total
 
     def estimate_context_tokens(
         self, system_prompt: str, memories: List[str], current_query: str
@@ -104,7 +190,7 @@ class TokenCounter:
         for message in messages:
             content = message.get("content", "")
             if content:
-                total_tokens += self.count_tokens(content)
+                total_tokens += self.count_content_tokens(content)
 
             if message.get("role") == "assistant":
                 reasoning = message.get("reasoning_content", "")
@@ -124,7 +210,7 @@ class TokenCounter:
             if message.get("role") == "tool":
                 tool_content = message.get("content", "")
                 if tool_content:
-                    total_tokens += self.count_tokens(tool_content)
+                    total_tokens += self.count_content_tokens(tool_content)
 
             total_tokens += 4
 
@@ -219,6 +305,22 @@ class ContextManager:
         }
 
     def get_effective_max_tokens(self) -> int:
+        return self.max_context_tokens
+
+    def set_max_context_tokens(self, value: int) -> int:
+        """运行时调整上下文容量（逐模型容量切换时使用）。
+
+        同步更新派生预算字段；非法值（<=0）被忽略并返回当前值。
+        """
+        try:
+            tokens = int(value)
+        except (TypeError, ValueError):
+            return self.max_context_tokens
+        if tokens <= 0 or tokens == self.max_context_tokens:
+            return self.max_context_tokens
+        self.max_context_tokens = tokens
+        self.input_budget_after_reserve = max(1, tokens - self.output_token_reserve)
+        self.effective_max_tokens = tokens
         return self.max_context_tokens
 
     def get_input_budget_after_reserve(self) -> int:

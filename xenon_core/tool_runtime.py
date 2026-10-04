@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union, get_type_hints
 
 from xenon_core.tool_payload_runtime import sanitize_tool_arguments_for_execution
+from xenon_core.tool_catalog import MODULE_NAME_ALIASES
 
 try:
     from watchdog.events import FileSystemEventHandler
@@ -28,6 +29,11 @@ except ImportError:
 logger = logging.getLogger(__name__)
 FILE_WATCHER_DEBOUNCE_DELAY = 2
 
+# Tools/*/plugin.yml 元数据文件名后缀（P4）：与模块 .py 同目录、同名，如
+#   Tools/terminal_handler.plugin.yml
+#   Tools/code_editor/code_editor_handler.plugin.yml
+PLUGIN_METADATA_SUFFIX = ".plugin.yml"
+
 
 class ToolManager:
     def __init__(self, tools_dir: Optional[Union[str, Path]] = None):
@@ -40,6 +46,9 @@ class ToolManager:
         self._debounce_lock = threading.Lock()
         self._rw_lock = threading.RLock()
         self.load_report: Dict[str, Any] = {}
+        # P4：模块别名表 = 静态别名（code_editor → code_editor_handler）+ 各模块 plugin.yml 的 aliases
+        self.module_aliases: Dict[str, str] = dict(MODULE_NAME_ALIASES)
+        self._module_metadata: Dict[str, Dict[str, Any]] = {}
         self._load_tools()
         self.start_file_watcher()
 
@@ -52,13 +61,9 @@ class ToolManager:
                 "module_names": [],
                 "tool_schema_count": 0,
                 "successes": [],
-                "failures": [
-                    {
-                        "module_name": "",
-                        "path": str(self.tools_dir),
-                        "error": "tools directory not found",
-                    }
-                ],
+                "failures": [],
+                "disabled_modules": [],
+                "metadata": {},
             }
             return
 
@@ -67,7 +72,10 @@ class ToolManager:
         loaded_modules = set()
         successes: List[Dict[str, Any]] = []
         failures: List[Dict[str, Any]] = []
+        disabled_modules: List[str] = []
         module_files: List[Path] = []
+        new_metadata: Dict[str, Dict[str, Any]] = {}
+        new_aliases: Dict[str, str] = dict(MODULE_NAME_ALIASES)
 
         for file_path in self.tools_dir.rglob("*.py"):
             if file_path.name.startswith("_"):
@@ -84,6 +92,14 @@ class ToolManager:
 
             module_name = file_path.stem
             import_name = self._get_import_name(relative_path)
+
+            # ── P4：plugin.yml 元数据 ──
+            metadata = self._load_module_metadata(file_path)
+            if metadata is not None:
+                new_metadata[module_name] = metadata
+                if metadata.get("enabled", True) is False:
+                    disabled_modules.append(module_name)
+                    continue
             try:
                 spec = importlib.util.spec_from_file_location(import_name, file_path)
                 if not spec or not spec.loader:
@@ -118,6 +134,7 @@ class ToolManager:
                                 "tool_name": tool_name,
                                 "path": str(file_path),
                                 "schema_count": generated_schema_count,
+                                "metadata": metadata or {},
                             }
                         )
                         module_loaded = True
@@ -130,12 +147,18 @@ class ToolManager:
                                 "manager_class": name,
                                 "path": str(file_path),
                                 "error": str(exc),
+                                "metadata": metadata or {},
                             }
                         )
                         logger.error(f"实例化工具管理器 {module_name}.{name} 失败: {exc}")
 
                 if module_loaded:
                     loaded_modules.add(module_name)
+                    if metadata and metadata.get("aliases"):
+                        for alias in metadata["aliases"]:
+                            alias_name = str(alias).strip()
+                            if alias_name and alias_name != module_name:
+                                new_aliases[alias_name] = module_name
 
             except Exception as exc:
                 failures.append(
@@ -144,14 +167,60 @@ class ToolManager:
                         "import_name": import_name,
                         "path": str(file_path),
                         "error": str(exc),
+                        "metadata": metadata or {},
                     }
                 )
                 logger.error(f"加载工具 {module_name} 失败: {exc}")
+
+        # ── P4：依赖校验（声明了 dependencies 的模块，其依赖必须已成功加载）──
+        dep_failures: List[Dict[str, Any]] = []
+        for module_name, metadata in new_metadata.items():
+            if module_name not in loaded_modules:
+                continue
+            deps = metadata.get("dependencies") or []
+            missing = [dep for dep in deps if dep not in loaded_modules]
+            if missing:
+                dep_failures.append(
+                    {
+                        "module_name": module_name,
+                        "import_name": module_name,
+                        "path": "",
+                        "error": f"依赖模块缺失或加载失败: {', '.join(missing)}",
+                        "metadata": metadata,
+                    }
+                )
+        for failure in dep_failures:
+            module_name = failure["module_name"]
+            failures.append(failure)
+            # 移除该模块已加载的工具与 schema
+            for tool_name in list(new_tools.keys()):
+                if tool_name.startswith(module_name + "_"):
+                    del new_tools[tool_name]
+            new_schemas[:] = [
+                schema
+                for schema in new_schemas
+                if not schema.get("function", {}).get("name", "").startswith(module_name + "_")
+            ]
+            loaded_modules.discard(module_name)
+
+        # ── P4：optional: false 的模块加载失败 → fail-loud ──
+        fatal_failures = [
+            failure
+            for failure in failures
+            if not (failure.get("metadata") or {}).get("optional", True)
+        ]
+        if fatal_failures:
+            summary = "; ".join(
+                f"{f.get('module_name')}: {f.get('error')}" for f in fatal_failures
+            )
+            raise RuntimeError(f"工具模块加载失败（optional: false）：{summary}")
 
         with self._rw_lock:
             self.tools = new_tools
             self.tool_schemas = new_schemas
             self.module_names = sorted(loaded_modules)
+            self.module_aliases = new_aliases
+            self._module_metadata = new_metadata
             self.load_report = {
                 "tools_dir": str(self.tools_dir),
                 "module_file_count": len(module_files),
@@ -159,7 +228,29 @@ class ToolManager:
                 "tool_schema_count": len(self.tool_schemas),
                 "successes": successes,
                 "failures": failures,
+                "disabled_modules": disabled_modules,
+                "metadata": dict(new_metadata),
             }
+
+    def _load_module_metadata(self, file_path: Path) -> Optional[Dict[str, Any]]:
+        """读取与模块 .py 同目录同名的 plugin.yml 元数据；不存在返回 None。
+
+        支持字段：enabled（默认 true）/ optional（默认 true，失败不阻断）/
+        aliases（模块别名列表）/ dependencies（依赖的模块名列表）/
+        version / description（仅记录）。
+        """
+        metadata_path = file_path.with_name(file_path.stem + PLUGIN_METADATA_SUFFIX)
+        if not metadata_path.exists():
+            return None
+        try:
+            import yaml
+
+            with open(metadata_path, "r", encoding="utf-8") as handle:
+                data = yaml.safe_load(handle)
+            return data if isinstance(data, dict) else {}
+        except Exception as error:
+            logger.warning("读取工具元数据失败 %s: %s", metadata_path, error)
+            return {}
 
     def _get_import_name(self, relative_path: Path) -> str:
         return ".".join(relative_path.with_suffix("").parts)
@@ -242,6 +333,45 @@ class ToolManager:
     def _get_method_description(self, method) -> str:
         return inspect.getdoc(method) or f"Execute {method.__name__}"
 
+    @staticmethod
+    def _infer_array_item_type(annotation_str: str) -> Dict[str, Any]:
+        """从数组类型注解推断 items schema。
+
+        Gemini 等供应商的 function calling 校验要求 type=array 的参数必须携带
+        items 字段，缺失会直接返回 400（OpenAI 系接口不校验，此前未暴露）。
+        此处从 List[...] / Tuple[...] 等注解推断元素类型；无法推断时回退 string。
+        """
+        match = re.search(
+            r"(?:List|list|Tuple|tuple|Sequence|Set|set|FrozenSet)\[([^\]]+)\]",
+            annotation_str or "",
+        )
+        if not match:
+            return {"type": "string"}
+
+        inner = match.group(1).strip()
+
+        # 嵌套数组（List[List[...]] / List[Tuple[...]]）→ items 为带 items 的 array
+        for key in ("List", "list", "Tuple", "tuple", "Sequence", "Set", "set"):
+            if key in inner:
+                return {"type": "array", "items": {"type": "string"}}
+
+        item_type_map = {
+            "Dict": "object",
+            "dict": "object",
+            "Mapping": "object",
+            "str": "string",
+            "string": "string",
+            "int": "integer",
+            "float": "number",
+            "double": "number",
+            "bool": "boolean",
+        }
+        for key, value in item_type_map.items():
+            if key in inner:
+                return {"type": value}
+
+        return {"type": "string"}
+
     def _get_method_parameters(self, method) -> Dict:
         sig = inspect.signature(method)
         parameters = {}
@@ -254,6 +384,11 @@ class ToolManager:
             "dict": "object",
             "Tuple": "array",
             "tuple": "array",
+            "Set": "array",
+            "set": "array",
+            "FrozenSet": "array",
+            "Sequence": "array",
+            "sequence": "array",
             "int": "integer",
             "float": "number",
             "double": "number",
@@ -286,6 +421,7 @@ class ToolManager:
                 continue
 
             param_type = "string"
+            annotation_str = ""
             param_desc = param_descriptions.get(name, f"Parameter {name}")
 
             if name in type_hints:
@@ -311,7 +447,11 @@ class ToolManager:
                         param_type = value
                         break
 
-            parameters[name] = {"type": param_type, "description": param_desc}
+            param_schema: Dict[str, Any] = {"type": param_type, "description": param_desc}
+            if param_type == "array":
+                # Gemini 等供应商校验要求 type=array 的参数必须携带 items（缺字段直接 400）
+                param_schema["items"] = self._infer_array_item_type(annotation_str)
+            parameters[name] = param_schema
 
             if param.default == inspect.Parameter.empty:
                 required.append(name)
@@ -333,6 +473,11 @@ class ToolManager:
     def get_load_report(self) -> Dict[str, Any]:
         with self._rw_lock:
             return copy.deepcopy(self.load_report)
+
+    def get_module_metadata(self) -> Dict[str, Dict[str, Any]]:
+        """模块元数据表（plugin.yml 内容，按模块名索引）。"""
+        with self._rw_lock:
+            return copy.deepcopy(self._module_metadata)
 
     def get_tool_schema_by_name(self, tool_name: str) -> Optional[Dict]:
         with self._rw_lock:

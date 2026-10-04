@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional
 
+from xenon_core.media_payload import build_user_content, parse_attachments
+
 
 INTERRUPTED_TOOL_CALL_MESSAGE = "[系统自动补全] 用户发起新输入，之前的工具调用已被中断"
 
@@ -9,6 +11,7 @@ INTERRUPTED_TOOL_CALL_MESSAGE = "[系统自动补全] 用户发起新输入，�
 def handle_user_chat_entry(
     *,
     user_input: str,
+    attachments: Optional[List[str]] = None,
     current_context: List[Dict[str, Any]],
     decay_recent_tool_results_fn: Callable[[str], None],
     set_interrupted_fn: Callable[[bool], None],
@@ -50,6 +53,29 @@ def handle_user_chat_entry(
     cleanup_reasoning_content_fn(current_context)
     append_conversation_message_fn(
         current_context,
-        {"role": "user", "content": user_input},
+        {
+            "role": "user",
+            "content": _build_user_message_content(user_input, attachments, logger),
+        },
     )
     process_chat_with_context_fn(user_input)
+
+
+def _build_user_message_content(
+    user_input: str,
+    attachments: Optional[List[str]],
+    logger: Any,
+) -> Any:
+    """解析附件并构造用户消息 content（原生多模态 Phase 1）。
+
+    无附件时返回原始字符串——存量行为 100% 不变；
+    附件解析失败不得阻断对话（降级为纯文本，记录 warning）。
+    """
+    try:
+        cleaned_text, media_refs = parse_attachments(
+            user_input, attachment_paths=attachments
+        )
+        return build_user_content(cleaned_text, media_refs)
+    except Exception as error:  # noqa: BLE001 - 解析失败不得阻断对话
+        logger.warning("附件解析失败，按纯文本处理: %s", error)
+        return user_input

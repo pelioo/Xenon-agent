@@ -5,17 +5,24 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Set
 
 
+# 静态模块名别名（P4：ToolManager 会把 Tools/*/plugin.yml 的 aliases 合并进来）
 MODULE_NAME_ALIASES = {
     "code_editor": "code_editor_handler",
 }
 
 
-def normalize_module_name(module_name: Any) -> str:
+def normalize_module_name(module_name: Any, alias_map: Optional[Dict[str, str]] = None) -> str:
     text = str(module_name or "").strip()
-    return MODULE_NAME_ALIASES.get(text, text)
+    aliases = dict(MODULE_NAME_ALIASES)
+    if alias_map:
+        aliases.update(alias_map)
+    return aliases.get(text, text)
 
 
-def normalize_module_names(module_names: List[Any]) -> tuple[List[str], List[str]]:
+def normalize_module_names(
+    module_names: List[Any],
+    alias_map: Optional[Dict[str, str]] = None,
+) -> tuple[List[str], List[str]]:
     normalized_names: List[str] = []
     alias_messages: List[str] = []
 
@@ -24,7 +31,7 @@ def normalize_module_names(module_names: List[Any]) -> tuple[List[str], List[str
         if not raw_name:
             continue
 
-        normalized_name = normalize_module_name(raw_name)
+        normalized_name = normalize_module_name(raw_name, alias_map=alias_map)
         if normalized_name != raw_name:
             alias_messages.append(f"↪ {raw_name} -> {normalized_name}: 已按模块别名规范化")
 
@@ -32,6 +39,75 @@ def normalize_module_names(module_names: List[Any]) -> tuple[List[str], List[str
             normalized_names.append(normalized_name)
 
     return normalized_names, alias_messages
+
+
+def build_core_management_tools() -> Dict[str, Dict[str, Any]]:
+    """构建 4 个核心元工具（load_module / get_tool_description / get_module_tools / get_module_list）。
+
+    从 agent_bootstrap 迁入（P4：由 tools 插件在激活时构建并注册为 tools.meta 服务）。
+    """
+    return {
+        "load_module_tool": {
+            "type": "function",
+            "function": {
+                "name": "load_module",
+                "description": "加载指定模块的所有工具描述，加载后可直接使用该模块的全部工具。一次可加载多个模块。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "module_names": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "要加载的模块名称列表，如 ['code_editor_handler', 'terminal_handler']",
+                        }
+                    },
+                    "required": ["module_names"],
+                },
+            },
+        },
+        "tool_description_tool": {
+            "type": "function",
+            "function": {
+                "name": "get_tool_description",
+                "description": "获取指定工具的详细描述和参数信息。当某个工具不在已加载模块中时，可用此工具单独获取。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "tool_name": {
+                            "type": "string",
+                            "description": "工具名称，例如 terminal_handler_Terminal_get_system_info",
+                        }
+                    },
+                    "required": ["tool_name"],
+                },
+            },
+        },
+        "get_module_tools_tool": {
+            "type": "function",
+            "function": {
+                "name": "get_module_tools",
+                "description": "获取指定模块下的所有工具名称列表，不含详细参数。加载工具请使用 load_module。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "module_name": {
+                            "type": "string",
+                            "description": "模块名称，例如 terminal_handler",
+                        }
+                    },
+                    "required": ["module_name"],
+                },
+            },
+        },
+        "get_module_list_tool": {
+            "type": "function",
+            "function": {
+                "name": "get_module_list",
+                "description": "获取所有已注册的工具模块名称列表。当不确定有哪些模块可用时，先调用此工具查看全部模块，再使用 load_module 加载所需模块。",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+    }
 
 
 def authorize_single_tool(
@@ -87,10 +163,16 @@ def build_current_tools(
     load_module_tool: Dict[str, Any],
     tool_description_tool: Dict[str, Any],
     get_module_tools_tool: Dict[str, Any],
+    get_module_list_tool: Dict[str, Any],
     loaded_modules: Dict[str, Dict[str, Any]],
     loaded_single_tools: Dict[str, Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    tools = [load_module_tool, tool_description_tool, get_module_tools_tool]
+    tools = [
+        load_module_tool,
+        tool_description_tool,
+        get_module_tools_tool,
+        get_module_list_tool,
+    ]
     for module_info in loaded_modules.values():
         tools.extend(module_info.get("tools", []))
 
@@ -193,6 +275,49 @@ def handle_get_tool_description_call(
         handle_tool_error_fn(messages, tool_call_id, error, "获取工具描述")
 
 
+def handle_get_module_list_call(
+    *,
+    tool_call_id: str,
+    arguments_str: str,
+    messages: List[Dict[str, Any]],
+    parse_arguments_fn: Callable[[str], Dict[str, Any]],
+    get_module_list_fn: Callable[[], List[str]],
+    add_tool_message_fn: Callable[[List[Dict[str, Any]], str, str], None],
+    handle_tool_error_fn: Callable[[List[Dict[str, Any]], str, Exception, str], None],
+    logger: Any,
+    print_fn: Callable[..., Any] = print,
+) -> None:
+    try:
+        parse_arguments_fn(arguments_str)
+        module_names = get_module_list_fn()
+
+        if not module_names:
+            response = "当前没有已注册的工具模块。"
+        else:
+            lines = "\n".join(
+                f"{index}. {name}" for index, name in enumerate(module_names, 1)
+            )
+            response = (
+                f"当前已注册的工具模块（共 {len(module_names)} 个）：\n\n"
+                f"{lines}\n\n"
+                "使用 load_module 加载模块后即可调用该模块的全部工具；"
+                "使用 get_module_tools 可查看某模块下的工具名称，"
+                "使用 get_tool_description 可查看单个工具的详细描述。"
+            )
+
+        print_fn(f"\n\033[38;2;195;197;64m获取模块列表: {len(module_names)} 个模块\033[0m")
+        add_tool_message_fn(messages, tool_call_id, response)
+
+    except json.JSONDecodeError as error:
+        logger.error("JSON解析失败: %s", error)
+        logger.error("原始参数字符串: %r", arguments_str)
+        error_msg = f"JSON解析错误: {error}\n原始参数: {arguments_str[:200]}..."
+        print_fn(f"错误: 参数格式错误 - {error}")
+        add_tool_message_fn(messages, tool_call_id, error_msg)
+    except Exception as error:
+        handle_tool_error_fn(messages, tool_call_id, error, "获取模块列表")
+
+
 def handle_get_module_tools_call(
     *,
     tool_call_id: str,
@@ -251,6 +376,7 @@ def handle_load_module_call(
     logger: Any,
     print_fn: Callable[..., Any] = print,
     now_fn: Callable[[], Any] = datetime.now,
+    alias_map: Optional[Dict[str, str]] = None,
 ) -> None:
     try:
         arguments = parse_arguments_fn(arguments_str)
@@ -259,7 +385,7 @@ def handle_load_module_call(
             module_names = [module_names]
         elif not isinstance(module_names, list):
             module_names = [module_names]
-        module_names, alias_messages = normalize_module_names(module_names)
+        module_names, alias_messages = normalize_module_names(module_names, alias_map=alias_map)
 
         if not module_names:
             error_msg = "错误：请提供至少一个模块名称。"

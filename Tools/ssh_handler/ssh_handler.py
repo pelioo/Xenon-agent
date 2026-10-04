@@ -1458,7 +1458,7 @@ class SshFileProxy:
         
         :param remote_path: 远程文件路径
         :param operations: 操作列表，支持的操作类型：
-            - {'type': 'replace', 'old': 'old_text', 'new': 'new_text'}
+            - {'type': 'replace', 'old_text': 'old_text', 'new_text': 'new_text'}  # 注意: 必须用 old_text/new_text, 'old'/'new' 会被框架吞掉
             - {'type': 'insert', 'line': line_num, 'content': 'content'}
             - {'type': 'delete', 'pattern': 'pattern'}
         :param encoding: 文件编码
@@ -1483,8 +1483,10 @@ class SshFileProxy:
                 op_type = op.get('type')
                 
                 if op_type == 'replace':
-                    old_text = op.get('old') or op.get('old_text')
-                    new_text = op.get('new') or op.get('new_text', '')
+                    # 注意: 'old'/'new' 是框架层保留字, 传参时会被吞掉/破坏,
+                    # 必须使用 'old_text'/'new_text' 作为参数名
+                    old_text = op.get('old_text') or op.get('old')
+                    new_text = op.get('new_text') or op.get('new', '')
                     if old_text:
                         if '\n' in old_text:
                             if old_text in content:
@@ -2207,7 +2209,7 @@ class SshToolManager:
         
         :param remote_path: 远程文件路径
         :param operations: 操作列表，支持的操作类型：
-            - {'type': 'replace', 'old': 'old_text', 'new': 'new_text'}
+            - {'type': 'replace', 'old_text': 'old_text', 'new_text': 'new_text'}  # 注意: 必须用 old_text/new_text, 'old'/'new' 会被框架吞掉
             - {'type': 'insert', 'line': line_num, 'content': 'content'}
             - {'type': 'delete', 'pattern': 'pattern'}
         :param encoding: 文件编码

@@ -141,10 +141,10 @@ class AIAgentStreamAdapter:
             return False
         return True
     
-    def stream_chat(self, user_input: str) -> Generator[StreamEvent, None, None]:
+    def stream_chat(self, user_input: str, attachments: Optional[List[str]] = None) -> Generator[StreamEvent, None, None]:
         logger.info(
-            "[stream_adapter] stream_chat starting, user_input=%r, agent.interrupted=%s",
-            user_input[:80], getattr(self.agent, "interrupted", None),
+            "[stream_adapter] stream_chat starting, user_input=%r, attachments=%s, agent.interrupted=%s",
+            user_input[:80], len(attachments or []), getattr(self.agent, "interrupted", None),
         )
         self._ensure_no_active_worker()
         # ★ 重置中断标志：确保上一轮残留的 interrupted=True 不会让新流的生成器循环立即 break
@@ -180,7 +180,7 @@ class AIAgentStreamAdapter:
             logger.info("[stream_adapter] chat thread starting for user_input=%r", user_input[:80])
             chat_start = time.monotonic()
             try:
-                self.agent.chat(user_input)
+                self.agent.chat(user_input, attachments=attachments)
             except Exception as e:
                 # 捕获完整的异常信息
                 error_traceback = traceback.format_exc()
@@ -336,12 +336,12 @@ class AsyncAIAgentWrapper:
         self.adapter = AIAgentStreamAdapter(agent)
         self._stream_lock = asyncio.Lock()
     
-    async def stream_chat_async(self, user_input: str):
+    async def stream_chat_async(self, user_input: str, attachments: Optional[List[str]] = None):
         async with self._stream_lock:
             loop = asyncio.get_running_loop()
-            
+
             def generator():
-                return self.adapter.stream_chat(user_input)
+                return self.adapter.stream_chat(user_input, attachments)
 
             gen = generator()
             pending_next = None
@@ -395,14 +395,15 @@ class AsyncAIAgentWrapper:
                 else:
                     close_generator()
     
-    def queue_message(self, message: str):
+    def queue_message(self, message: str, attachments: Optional[List[str]] = None):
         """将消息排入 agent 内部队列。在活跃流期间由 WebUI 调用。
 
         直接调用 AIAgent.chat()，agent 会检测 _turn_running 并自动入队 +
         通过当前活跃的 stream_callback 发送 user_queued 事件到 SSE 流。
+        附件路径随消息透传（排队路径内部转 @token，复用统一解析）。
         """
         if hasattr(self.agent, 'chat'):
-            return self.agent.chat(message)
+            return self.agent.chat(message, attachments=attachments)
         return {"queued": False, "reason": "agent_does_not_support_queueing"}
 
     def interrupt(self):

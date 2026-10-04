@@ -23,10 +23,28 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
+try:
+    from _async_common import async_capable, list_async_tasks as list_async_tasks_global
+except ImportError:  # 以 Tools.xxx 包方式导入时（测试/脚本）
+    from Tools._async_common import async_capable, list_async_tasks as list_async_tasks_global
+
 
 DEFAULT_OUTPUT_DIR = Path("work") / "video_outputs"
 VIDEO_EXTENSIONS = [".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".wmv", ".flv"]
 AUDIO_EXTENSIONS = [".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wma"]
+
+# 适合后台异步执行的重操作（ffmpeg 转码/合成类，默认 auto 路由到后台）
+_VIDEO_ASYNC_ACTIONS = (
+    "trim_video",
+    "split_video",
+    "merge_videos",
+    "add_audio_to_video",
+    "extract_audio",
+    "remove_audio",
+    "convert_video",
+    "create_thumbnail",
+    "create_gif",
+)
 
 
 class VideoHandler:
@@ -864,6 +882,9 @@ class VideoHandler:
 
 
 class VideoToolManager:
+    # auto 模式下默认走后台的重操作
+    _ASYNC_ACTIONS = _VIDEO_ASYNC_ACTIONS
+
     def __init__(self):
         self.handler = VideoHandler()
 
@@ -879,6 +900,14 @@ class VideoToolManager:
         """
         return self.handler.get_media_info(input_path=input_path, include_raw=include_raw)
 
+    def list_async_tasks(self, include_done: bool = True) -> Dict[str, Any]:
+        """列出本模块所有后台异步任务状态。
+
+        :param include_done: 是否包含已完成任务（默认 True）。
+        """
+        return list_async_tasks_global(include_done)
+
+    @async_capable("trim_video", async_actions=_VIDEO_ASYNC_ACTIONS, source="video", scenario="video_result")
     def trim_video(
         self,
         input_path: str,
@@ -893,6 +922,7 @@ class VideoToolManager:
         preset: str = "medium",
         overwrite: bool = True,
         timeout: int = 1800,
+        async_mode: str = "auto",
     ) -> Dict[str, Any]:
         """Cut one segment from a video.
 
@@ -924,6 +954,7 @@ class VideoToolManager:
             timeout=timeout,
         )
 
+    @async_capable("split_video", async_actions=_VIDEO_ASYNC_ACTIONS, source="video", scenario="video_result")
     def split_video(
         self,
         input_path: str,
@@ -935,6 +966,7 @@ class VideoToolManager:
         max_segments: int = 500,
         overwrite: bool = True,
         timeout: int = 1800,
+        async_mode: str = "auto",
     ) -> Dict[str, Any]:
         """Split a video by fixed segment duration or explicit cut points.
 
@@ -960,6 +992,7 @@ class VideoToolManager:
             timeout=timeout,
         )
 
+    @async_capable("merge_videos", async_actions=_VIDEO_ASYNC_ACTIONS, source="video", scenario="video_result")
     def merge_videos(
         self,
         input_paths: List[str],
@@ -971,6 +1004,7 @@ class VideoToolManager:
         preset: str = "medium",
         overwrite: bool = True,
         timeout: int = 3600,
+        async_mode: str = "auto",
     ) -> Dict[str, Any]:
         """Concatenate multiple videos in order.
 
@@ -996,6 +1030,7 @@ class VideoToolManager:
             timeout=timeout,
         )
 
+    @async_capable("add_audio_to_video", async_actions=_VIDEO_ASYNC_ACTIONS, source="video", scenario="video_result")
     def add_audio_to_video(
         self,
         video_path: str,
@@ -1010,6 +1045,7 @@ class VideoToolManager:
         audio_codec: str = "aac",
         overwrite: bool = True,
         timeout: int = 1800,
+        async_mode: str = "auto",
     ) -> Dict[str, Any]:
         """Add, replace, or mix an audio file into a video.
 
@@ -1041,6 +1077,7 @@ class VideoToolManager:
             timeout=timeout,
         )
 
+    @async_capable("extract_audio", async_actions=_VIDEO_ASYNC_ACTIONS, source="video", scenario="video_result")
     def extract_audio(
         self,
         input_path: str,
@@ -1049,6 +1086,7 @@ class VideoToolManager:
         bitrate: str = "192k",
         overwrite: bool = True,
         timeout: int = 1800,
+        async_mode: str = "auto",
     ) -> Dict[str, Any]:
         """Extract audio from a video or audio container.
 
@@ -1068,7 +1106,8 @@ class VideoToolManager:
             timeout=timeout,
         )
 
-    def remove_audio(self, input_path: str, output_path: str = "", overwrite: bool = True, timeout: int = 1800) -> Dict[str, Any]:
+    @async_capable("remove_audio", async_actions=_VIDEO_ASYNC_ACTIONS, source="video", scenario="video_result")
+    def remove_audio(self, input_path: str, output_path: str = "", overwrite: bool = True, timeout: int = 1800, async_mode: str = "auto") -> Dict[str, Any]:
         """Create a video-only copy with all audio tracks removed.
 
         :param input_path: Source video file.
@@ -1078,6 +1117,7 @@ class VideoToolManager:
         """
         return self.handler.remove_audio(input_path=input_path, output_path=output_path, overwrite=overwrite, timeout=timeout)
 
+    @async_capable("convert_video", async_actions=_VIDEO_ASYNC_ACTIONS, source="video", scenario="video_result")
     def convert_video(
         self,
         input_path: str,
@@ -1092,6 +1132,7 @@ class VideoToolManager:
         keep_audio: bool = True,
         overwrite: bool = True,
         timeout: int = 3600,
+        async_mode: str = "auto",
     ) -> Dict[str, Any]:
         """Convert, resize, or compress a video.
 
@@ -1123,6 +1164,7 @@ class VideoToolManager:
             timeout=timeout,
         )
 
+    @async_capable("create_thumbnail", async_actions=_VIDEO_ASYNC_ACTIONS, source="video", scenario="video_result")
     def create_thumbnail(
         self,
         input_path: str,
@@ -1132,6 +1174,7 @@ class VideoToolManager:
         height: int = 0,
         overwrite: bool = True,
         timeout: int = 600,
+        async_mode: str = "auto",
     ) -> Dict[str, Any]:
         """Export a still image from a video.
 
@@ -1153,6 +1196,7 @@ class VideoToolManager:
             timeout=timeout,
         )
 
+    @async_capable("create_gif", async_actions=_VIDEO_ASYNC_ACTIONS, source="video", scenario="video_result")
     def create_gif(
         self,
         input_path: str,
@@ -1163,6 +1207,7 @@ class VideoToolManager:
         fps: int = 12,
         overwrite: bool = True,
         timeout: int = 1800,
+        async_mode: str = "auto",
     ) -> Dict[str, Any]:
         """Create a GIF preview from a video segment.
 
